@@ -35,10 +35,12 @@ them at a parent archive + its `Ext` dir):
 
 ```text
 osmflat-extc --taginfo --backrefs --out dc.ext district-of-columbia.osmflat
+osmflat-extc --combinations --backrefs --out dc-combos.ext district-of-columbia.osmflat
 
 # taginfo browser (keys table / values table / key=value with example ids)
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway
+cargo run --example taginfo  -- district-of-columbia.osmflat dc-combos.ext highway --combinations
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway crossing
 
 # reverse references (OSM-id lookup needs the parent built with --reverse-ids)

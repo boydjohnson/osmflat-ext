@@ -15,6 +15,7 @@
 //!
 //! # one key: its stats and most common values (the "values" table)
 //! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway
+//! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway --combinations
 //!
 //! # one key=value: counts by type and a few example OSM ids
 //! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway primary
@@ -39,6 +40,11 @@ struct Args {
     key: Option<String>,
     /// Optional value (with `key`) to inspect a single `key=value`.
     value: Option<String>,
+    /// With a key, print co-occurring keys instead of values.
+    ///
+    /// Requires building the sidecar with `osmflat-extc --combinations`.
+    #[arg(long)]
+    combinations: bool,
     /// How many rows to print.
     #[arg(long, default_value_t = 20)]
     top: usize,
@@ -62,10 +68,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .taginfo()
         .ok_or("sidecar has no taginfo sub-archive (rebuild with --taginfo)")?;
 
-    match (args.key.as_deref(), args.value.as_deref()) {
-        (None, _) => list_keys(&tq, args.top),
-        (Some(key), None) => show_key(&tq, key, args.top),
-        (Some(key), Some(value)) => show_kv(archive.parent(), &tq, key, value, args.top),
+    match (
+        args.key.as_deref(),
+        args.value.as_deref(),
+        args.combinations,
+    ) {
+        (None, _, _) => list_keys(&tq, args.top),
+        (Some(key), None, false) => show_key(&tq, key, args.top),
+        (Some(key), None, true) => show_combinations(&tq, key, args.top),
+        (Some(_), Some(_), true) => {
+            Err("--combinations can only be used with a key, not key=value".into())
+        }
+        (Some(key), Some(value), false) => show_kv(archive.parent(), &tq, key, value, args.top),
     }
 }
 
@@ -129,6 +143,36 @@ fn show_key(tq: &TaginfoQuery, key: &str, top: usize) -> Result<(), Box<dyn std:
             c.relations,
         );
     }
+    Ok(())
+}
+
+/// Taginfo "combinations": other keys used by objects that carry this key.
+fn show_combinations(
+    tq: &TaginfoQuery,
+    key: &str,
+    top: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let k = tq
+        .key(key.as_bytes())
+        .ok_or_else(|| format!("key {key:?} not found"))?;
+    let combos: Vec<_> = k
+        .combinations()
+        .map(|c| (c.key().to_vec(), c.together_count()))
+        .collect();
+
+    if combos.is_empty() {
+        println!(
+            "{key}: no combinations stored (rebuild the sidecar with osmflat-extc --combinations)"
+        );
+        return Ok(());
+    }
+
+    println!("{key}: top co-occurring keys\n");
+    println!("{:<28} {:>12}", "other key", "together");
+    for (other_key, together_count) in combos.into_iter().take(top) {
+        println!("{:<28} {:>12}", s(&other_key), together_count);
+    }
+
     Ok(())
 }
 
