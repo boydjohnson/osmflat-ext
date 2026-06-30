@@ -1,0 +1,21 @@
+[package]
+name = "osmflat-extc"
+description = "Compiler that builds osmflat-ext sidecar archives (taginfo, backrefs) from an osmflat archive."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "osmflat-extc"
+path = "src/main.rs"
+
+[lib]
+name = "osmflat_extc"
+path = "src/lib.rs"
+
+[dependencies]
+osmflat-ext = { path = "../osmflat-ext", features = ["build-support"] }
+osmflat.workspace = true
+flatdata.workspace = true
+clap = { version = "4.1", features = ["derive"] }

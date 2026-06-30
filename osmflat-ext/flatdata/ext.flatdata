@@ -1,0 +1,169 @@
+/// osmflat extension archive: inverted tag index, taginfo histograms, and
+/// reverse references for an existing `osm.Osm` archive.
+///
+/// This is a *sibling* archive: it never modifies the parent `Osm` archive and
+/// is meaningless without it. All `*_idx` fields that name strings are indices
+/// into the **parent** `Osm.stringtable`; all `Ref.value` fields are indices
+/// into the **parent** `nodes` / `ways` / `relations` vectors. flatdata has no
+/// cross-archive reference concept, so these are plain `u40` values interpreted
+/// against the parent at query time (see `ExtHeader` for the staleness guard).
+
+namespace osm_ext {
+
+/// Special value which represents an invalid index (matches `osm.INVALID_IDX`).
+const u64 INVALID_IDX = 0xFFFFFFFFFF;
+
+/**
+ * Fingerprint of the exact parent `Osm` archive this sidecar was built from.
+ *
+ * A sidecar hard-codes parent entity indices and parent stringtable indices,
+ * both of which change whenever the parent is recompiled or reordered. The
+ * query layer compares this against the live parent and refuses to serve any
+ * query on mismatch.
+ */
+struct ExtHeader {
+    /// Hash of the parent's embedded schema bytes (`osm.flatdata`).
+    parent_schema_hash: u64 : 64;
+    /// Parent vector lengths at build time (cheap; catches rebuilds/reorders).
+    parent_node_count: u64 : 40;
+    parent_way_count: u64 : 40;
+    parent_relation_count: u64 : 40;
+    parent_tags_count: u64 : 40;
+    parent_stringtable_len: u64 : 64;
+    /// Parent replication sequence number, or 0 if absent.
+    parent_replication_sequence_number: i64 : 64;
+    /// Writing program / tool version (index into this archive's `stringtable`).
+    builder_idx: u64 : 40;
+}
+
+// ---------------------------------------------------------------------------
+// Taginfo: key -> value -> postings  (inverted tag index + histograms)
+// ---------------------------------------------------------------------------
+
+/**
+ * A distinct OSM key. Entries in `keys` are sorted by key **string** (not by
+ * `key_idx`), so a key can be found by binary search / prefix scan.
+ */
+struct KeyEntry {
+    /// Key string, index into the parent `Osm.stringtable`.
+    key_idx: u64 : 40;
+    /**
+     * Number of entities carrying this key, split by type (O(1) key stats).
+     * A key's total is not derivable from value postings without summing, so
+     * it is stored; OSM keys are unique per object, so no double counting.
+     */
+    count_nodes: u64 : 40;
+    count_ways: u64 : 40;
+    count_relations: u64 : 40;
+    /// Range of this key's distinct values in `values`.
+    @range(values)
+    value_first_idx: u64 : 40;
+}
+
+/**
+ * A distinct value for a given key. Within one key's value range, entries are
+ * sorted by value **string**. Per-(key,value) per-type counts are NOT stored:
+ * they equal the corresponding postings range length.
+ */
+struct ValueEntry {
+    /// Value string, index into the parent `Osm.stringtable`.
+    value_idx: u64 : 40;
+    /**
+     * Postings of entities having this exact (key,value), one range per type.
+     * Postings are ascending parent indices == spatial (SFC) order, so they
+     * merge-join with bbox ranges and with each other.
+     */
+    @range(node_post)
+    node_first_idx: u64 : 40;
+    @range(way_post)
+    way_first_idx: u64 : 40;
+    @range(rel_post)
+    rel_first_idx: u64 : 40;
+}
+
+/// A reference into the parent `nodes` / `ways` / `relations` vector.
+struct Ref {
+    value: u64 : 40;
+}
+
+/**
+ * Inverted tag index and taginfo histograms.
+ */
+archive Taginfo {
+    /**
+     * Distinct keys, sorted by key string. Trailing sentinel closes the last
+     * key's `values` range.
+     */
+    keys: vector< KeyEntry >;
+    /**
+     * Distinct values, grouped by key, sorted by value string within a key.
+     * Trailing sentinel closes the last value's postings ranges.
+     */
+    values: vector< ValueEntry >;
+    /// Per-(key,value) node postings (ascending node indices).
+    node_post: vector< Ref >;
+    /// Per-(key,value) way postings (ascending way indices).
+    way_post: vector< Ref >;
+    /// Per-(key,value) relation postings (ascending relation indices).
+    rel_post: vector< Ref >;
+}
+
+// ---------------------------------------------------------------------------
+// Backrefs: reverse references (node -> ways, X -> relations)
+// ---------------------------------------------------------------------------
+
+/// Generic 1:n range holder, one per parent entity, parallel to a parent vector.
+struct Range {
+    @range(post)
+    first_idx: u64 : 40;
+}
+
+/**
+ * Reverse references. Each `*_range` vector is parallel to a parent entity
+ * vector (plus a trailing sentinel) and slices the matching postings vector.
+ */
+archive Backrefs {
+    /// Parallel to parent `nodes`: ways referencing each node.
+    node_ways_range: vector< Range >;
+    /// Way indices, grouped by referenced node, ascending.
+    ways_of_node: vector< Ref >;
+
+    /// Parallel to parent `nodes`: relations whose members include each node.
+    node_rels_range: vector< Range >;
+    rels_of_node: vector< Ref >;
+
+    /// Parallel to parent `ways`: relations whose members include each way.
+    way_rels_range: vector< Range >;
+    rels_of_way: vector< Ref >;
+
+    /// Parallel to parent `relations`: relations whose members include a relation.
+    rel_rels_range: vector< Range >;
+    rels_of_rel: vector< Ref >;
+}
+
+// ---------------------------------------------------------------------------
+// Umbrella archive
+// ---------------------------------------------------------------------------
+
+/**
+ * Sibling extension archive for an `osm.Osm` archive. Each capability is an
+ * optional sub-archive, built independently (`--taginfo`, `--backrefs`).
+ */
+archive Ext {
+    /// Fingerprint of the parent archive this sidecar indexes.
+    @explicit_reference( ExtHeader.builder_idx, stringtable )
+    header: ExtHeader;
+
+    /// String storage for this archive's own metadata (e.g. builder version).
+    stringtable: raw_data;
+
+    /// Inverted tag index + taginfo histograms.
+    @optional
+    taginfo: archive Taginfo;
+
+    /// Reverse references.
+    @optional
+    backrefs: archive Backrefs;
+}
+
+} // namespace osm_ext

@@ -1,0 +1,18 @@
+[workspace]
+members = [
+    "osmflat-ext",
+    "osmflat-extc",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT/Apache-2.0"
+repository = "https://github.com/boydjohnson/osmflat-ext"
+
+[workspace.dependencies]
+# The parent format. Path-pinned to the local checkout that carries the
+# `feature/spatial-index` + `Ids` work this crate is designed against.
+osmflat = { path = "../osmflat-rs/osmflat" }
+flatdata = "0.5.3"

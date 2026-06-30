@@ -1,0 +1,17 @@
+[package]
+name = "osmflat-ext"
+description = "Sidecar indexes (inverted tag index, taginfo, reverse refs) and query support for osmflat archives."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+osmflat.workspace = true
+flatdata.workspace = true
+
+[features]
+default = []
+# Re-exports the builder side of the generated bindings + small synthetic-archive
+# helpers, so `osmflat-extc` and integration tests can construct sidecars.
+build-support = []
