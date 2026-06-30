@@ -48,7 +48,8 @@ cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 53546211
 
 ## Status
 
-**Phases 1 (Taginfo) and 2 (Backrefs) are implemented and tested.**
+**Phases 1 (Taginfo) and 2 (Backrefs), plus non-bbox node spatial queries, are
+implemented and tested.**
 
 - `osmflat-extc --taginfo` builds the inverted tag index + histograms; the query
   side does key/value binary search, postings, and the bbox merge-join.
@@ -58,6 +59,9 @@ cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 53546211
   merge-join: bbox candidates come from osmflat's own exact spatial query,
   get run-length compressed to contiguous index ranges, and merge-join the tag
   postings via `query::intersect_bbox` (`O(R·log k)`).
+- `spatial::{nodes_within_radius,k_nearest_nodes,nodes_in_polygon}` provide
+  node radius, nearest-neighbor, and polygon queries without an extension
+  sidecar.
 - The fingerprint guard is wired into `ExtArchive::open`.
 
 All three are checked end-to-end by synthetic, in-memory tests behind
@@ -71,9 +75,8 @@ The tests build a parent `Osm` archive through `osmflat/test-support`, build the
 extension archive in memory, and validate taginfo, backrefs, and bbox
 merge-join results against brute-force oracles.
 
-Still stubbed (`todo!()`): non-bbox spatial (`osmflat-ext/src/spatial.rs`) and
-taginfo `--combinations`. Both sidecar builds are the in-RAM form; planet-scale
-mmap scratch is not yet wired up.
+Still incomplete: taginfo `--combinations`. Both sidecar builds are the in-RAM
+form; planet-scale mmap scratch is not yet wired up.
 
 The parent is a path dependency on `../osmflat-rs/osmflat` (the
 `feature/spatial-index` + `Ids` branch this is designed against).
