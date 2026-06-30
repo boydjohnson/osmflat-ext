@@ -82,7 +82,7 @@ pub fn build_into(
     let header = osmflat_ext::fingerprint::build_header(parent, builder_idx);
     builder.set_header(&header)?;
 
-    if opts.taginfo {
+    if opts.taginfo || opts.combinations {
         let taginfo = builder.taginfo()?;
         build_taginfo::build(parent, &taginfo, opts)?;
     }

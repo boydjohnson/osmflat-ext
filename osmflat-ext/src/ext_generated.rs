@@ -236,22 +236,22 @@ impl ExtHeader {
 /// `key_idx`), so a key can be found by binary search / prefix scan.
 #[repr(transparent)]
 pub struct KeyEntry {
-    data: [u8; 25],
+    data: [u8; 30],
 }
 
 impl KeyEntry {
     /// Unsafe since the struct might not be self-contained
     pub unsafe fn new_unchecked( ) -> Self {
-        Self{data : [0; 25]}
+        Self{data : [0; 30]}
     }
 }
 
 impl flatdata::Struct for KeyEntry {
     unsafe fn create_unchecked( ) -> Self {
-        Self{data : [0; 25]}
+        Self{data : [0; 30]}
     }
 
-    const SIZE_IN_BYTES: usize = 25;
+    const SIZE_IN_BYTES: usize = 30;
     const IS_OVERLAPPING_WITH_NEXT : bool = true;
 }
 
@@ -299,7 +299,24 @@ impl KeyEntry {
     #[inline]
     pub fn values(&self) -> std::ops::Range<u64> {
         let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 160, 40);
-        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 160 + 25 * 8, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 160 + 30 * 8, 40);
+        start..end
+    }
+
+    /// First element of the range [`combos`].
+    ///
+    /// [`combos`]: #method.combos
+    #[inline]
+    pub fn combo_first_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 200, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Range of other keys used by objects that have this key.
+    #[inline]
+    pub fn combos(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 200, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 200 + 30 * 8, 40);
         start..end
     }
 
@@ -313,6 +330,7 @@ impl std::fmt::Debug for KeyEntry {
             .field("count_ways", &self.count_ways())
             .field("count_relations", &self.count_relations())
             .field("value_first_idx", &self.value_first_idx())
+            .field("combo_first_idx", &self.combo_first_idx())
             .finish()
     }
 }
@@ -320,7 +338,7 @@ impl std::fmt::Debug for KeyEntry {
 impl std::cmp::PartialEq for KeyEntry {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.key_idx() == other.key_idx() &&        self.count_nodes() == other.count_nodes() &&        self.count_ways() == other.count_ways() &&        self.count_relations() == other.count_relations() &&        self.value_first_idx() == other.value_first_idx()     }
+        self.key_idx() == other.key_idx() &&        self.count_nodes() == other.count_nodes() &&        self.count_ways() == other.count_ways() &&        self.count_relations() == other.count_relations() &&        self.value_first_idx() == other.value_first_idx() &&        self.combo_first_idx() == other.combo_first_idx()     }
 }
 
 impl KeyEntry {
@@ -361,6 +379,15 @@ impl KeyEntry {
         flatdata_write_bytes!(u64; value, self.data, 160, 40)
     }
 
+    /// First element of the range [`combos`].
+    ///
+    /// [`combos`]: struct.KeyEntryRef.html#method.combos
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_combo_first_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 200, 40)
+    }
+
 
     /// Copies the data from `other` into this struct.
     #[inline]
@@ -370,6 +397,7 @@ impl KeyEntry {
         self.set_count_ways(other.count_ways());
         self.set_count_relations(other.count_relations());
         self.set_value_first_idx(other.value_first_idx());
+        self.set_combo_first_idx(other.combo_first_idx());
     }
 }
 /// A distinct value for a given key. Within one key's value range, entries are
@@ -635,6 +663,138 @@ impl Ref {
         self.set_value(other.value());
     }
 }
+/// A key co-occurrence entry for taginfo combinations.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct ComboEntry {
+    data: [u8; 10],
+}
+
+impl ComboEntry {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 10]}
+    }
+}
+
+impl flatdata::Struct for ComboEntry {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 10]}
+    }
+
+    const SIZE_IN_BYTES: usize = 10;
+    const IS_OVERLAPPING_WITH_NEXT : bool = false;
+}
+
+impl ComboEntry {
+    pub fn new( ) -> Self {
+        Self{data : [0; 10]}
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes(data: &[u8; 10]) -> &Self {
+        // Safety: This is safe since ComboEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes_mut(data: &mut [u8; 10]) -> &mut Self {
+        // Safety: This is safe since ComboEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice(data: &[u8]) -> Result<&Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 10 {
+            assert_eq!(data.len(), 10);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *const [u8; 10];
+        // Safety: We checked length before
+        Ok(Self::from_bytes(unsafe { &*ptr }))
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice_mut(data: &mut [u8]) -> Result<&mut Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 10 {
+            assert_eq!(data.len(), 10);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *mut [u8; 10];
+        // Safety: We checked length before
+        Ok(Self::from_bytes_mut(unsafe { &mut *ptr }))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 10] {
+        &self.data
+    }
+}
+
+impl Default for ComboEntry {
+    fn default( ) -> Self {
+        Self::new( )
+    }
+}
+
+unsafe impl flatdata::NoOverlap for ComboEntry {}
+
+impl ComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    #[inline]
+    pub fn other_key_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Number of parent entities carrying this key and `other_key_idx`.
+    #[inline]
+    pub fn together_count(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 40, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+}
+
+impl std::fmt::Debug for ComboEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("ComboEntry")
+            .field("other_key_idx", &self.other_key_idx())
+            .field("together_count", &self.together_count())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for ComboEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.other_key_idx() == other.other_key_idx() &&        self.together_count() == other.together_count()     }
+}
+
+impl ComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_other_key_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 0, 40)
+    }
+
+    /// Number of parent entities carrying this key and `other_key_idx`.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_together_count(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 40, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &ComboEntry) {
+        self.set_other_key_idx(other.other_key_idx());
+        self.set_together_count(other.together_count());
+    }
+}
 /// Generic 1:n range holder, one per parent entity, parallel to a parent vector.
 #[repr(transparent)]
 pub struct Range {
@@ -721,6 +881,7 @@ pub struct Taginfo {
     node_post : &'static [super::osm_ext::Ref],
     way_post : &'static [super::osm_ext::Ref],
     rel_post : &'static [super::osm_ext::Ref],
+    combos : &'static [super::osm_ext::ComboEntry],
 }
 
 impl Taginfo {
@@ -760,6 +921,13 @@ impl Taginfo {
         self.rel_post
     }
 
+    /// Per-key co-occurring keys, sorted by descending together_count and then
+/// key string. Empty unless built with `osmflat-extc --combinations`.
+    #[inline]
+    pub fn combos(&self) -> &[super::osm_ext::ComboEntry] {
+        self.combos
+    }
+
 }
 
 impl ::std::fmt::Debug for Taginfo {
@@ -770,6 +938,7 @@ impl ::std::fmt::Debug for Taginfo {
             .field("node_post", &self.node_post())
             .field("way_post", &self.way_post())
             .field("rel_post", &self.rel_post())
+            .field("combos", &self.combos())
             .finish()
     }
 }
@@ -818,6 +987,12 @@ impl Taginfo {
             let resource = extend(storage.read("rel_post", schema::taginfo::resources::REL_POST));
             check("rel_post", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
         };
+        let combos = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("combos", schema::taginfo::resources::COMBOS));
+            check("combos", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::ComboEntry]>::from_bytes(x)))?
+        };
 
         Ok(Self {
             _storage: storage,
@@ -826,6 +1001,7 @@ impl Taginfo {
             node_post,
             way_post,
             rel_post,
+            combos,
         })
     }
 }
@@ -947,6 +1123,28 @@ impl TaginfoBuilder {
     #[inline]
     pub fn start_rel_post(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
         flatdata::create_external_vector(&*self.storage, "rel_post", schema::taginfo::resources::REL_POST)
+    }
+
+    #[inline]
+    /// Stores [`combos`] in the archive.
+    ///
+    /// [`combos`]: struct.Taginfo.html#method.combos
+    pub fn set_combos(&self, vector: &[super::osm_ext::ComboEntry]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("combos", schema::taginfo::resources::COMBOS, vector.as_bytes())
+    }
+
+    /// Opens [`combos`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`combos`]: struct.Taginfo.html#method.combos
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_combos(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::ComboEntry>> {
+        flatdata::create_external_vector(&*self.storage, "combos", schema::taginfo::resources::COMBOS)
     }
 
 }
@@ -1493,6 +1691,8 @@ struct KeyEntry
     count_relations : u64 : 40;
     @range( values )
     value_first_idx : u64 : 40;
+    @range( combos )
+    combo_first_idx : u64 : 40;
 }
 }
 
@@ -1517,6 +1717,14 @@ struct Ref
 }
 
 namespace osm_ext {
+struct ComboEntry
+{
+    other_key_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -1528,6 +1736,7 @@ archive Taginfo
     node_post : vector< .osm_ext.Ref >;
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
+    combos : vector< .osm_ext.ComboEntry >;
 }
 }
 
@@ -1543,6 +1752,8 @@ struct KeyEntry
     count_relations : u64 : 40;
     @range( values )
     value_first_idx : u64 : 40;
+    @range( combos )
+    combo_first_idx : u64 : 40;
 }
 }
 
@@ -1616,6 +1827,22 @@ namespace osm_ext {
 archive Taginfo
 {
     rel_post : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+pub const COMBOS: &str = r#"namespace osm_ext {
+struct ComboEntry
+{
+    other_key_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Taginfo
+{
+    combos : vector< .osm_ext.ComboEntry >;
 }
 }
 
@@ -1811,6 +2038,8 @@ struct KeyEntry
     count_relations : u64 : 40;
     @range( values )
     value_first_idx : u64 : 40;
+    @range( combos )
+    combo_first_idx : u64 : 40;
 }
 }
 
@@ -1835,6 +2064,14 @@ struct Ref
 }
 
 namespace osm_ext {
+struct ComboEntry
+{
+    other_key_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -1846,6 +2083,7 @@ archive Taginfo
     node_post : vector< .osm_ext.Ref >;
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
+    combos : vector< .osm_ext.ComboEntry >;
 }
 }
 
@@ -1927,6 +2165,8 @@ struct KeyEntry
     count_relations : u64 : 40;
     @range( values )
     value_first_idx : u64 : 40;
+    @range( combos )
+    combo_first_idx : u64 : 40;
 }
 }
 
@@ -1951,6 +2191,14 @@ struct Ref
 }
 
 namespace osm_ext {
+struct ComboEntry
+{
+    other_key_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -1962,6 +2210,7 @@ archive Taginfo
     node_post : vector< .osm_ext.Ref >;
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
+    combos : vector< .osm_ext.ComboEntry >;
 }
 }
 

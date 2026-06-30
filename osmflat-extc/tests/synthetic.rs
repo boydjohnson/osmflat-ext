@@ -234,6 +234,13 @@ fn taginfo_matches_brute_force_oracle() {
 
     assert_eq!(sidecar_keys, oracle.distinct_keys());
     assert!(checked_values > 0, "no values checked");
+    for key_view in taginfo.keys() {
+        assert_eq!(
+            key_view.combinations().count(),
+            0,
+            "combinations should be empty without --combinations"
+        );
+    }
 
     let amenity_cafe = taginfo
         .kv(b"amenity", b"cafe")
@@ -241,6 +248,99 @@ fn taginfo_matches_brute_force_oracle() {
     assert_eq!(
         refs_to_vec(amenity_cafe.nodes()),
         TagOracle::get(&oracle.kv_nodes, b"amenity", b"cafe")
+    );
+}
+
+#[derive(Default)]
+struct CombinationOracle {
+    by_key: HashMap<Key, Vec<(Key, u64)>>,
+}
+
+impl CombinationOracle {
+    fn build(parent: &Osm) -> Self {
+        let mut counts: HashMap<(Key, Key), u64> = HashMap::new();
+
+        for keys in entity_keys(parent) {
+            for key in &keys {
+                for other_key in &keys {
+                    if key != other_key {
+                        *counts.entry((key.clone(), other_key.clone())).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        let mut by_key: HashMap<Key, Vec<(Key, u64)>> = HashMap::new();
+        for ((key, other_key), together_count) in counts {
+            by_key
+                .entry(key)
+                .or_default()
+                .push((other_key, together_count));
+        }
+        for combos in by_key.values_mut() {
+            combos.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        }
+
+        CombinationOracle { by_key }
+    }
+}
+
+fn entity_keys(parent: &Osm) -> Vec<Vec<Key>> {
+    let tags = parent.tags();
+    let tags_index = parent.tags_index();
+    let strings = parent.stringtable();
+    let mut out = Vec::new();
+
+    for range in parent
+        .nodes()
+        .iter()
+        .map(|node| node.tags())
+        .chain(parent.ways().iter().map(|way| way.tags()))
+        .chain(parent.relations().iter().map(|relation| relation.tags()))
+    {
+        let mut keys: Vec<Key> = range
+            .map(|tag_index_idx| {
+                let tag = &tags[tags_index[tag_index_idx as usize].value() as usize];
+                strings.substring_raw(tag.key_idx() as usize).to_vec()
+            })
+            .collect();
+        keys.sort();
+        keys.dedup();
+        out.push(keys);
+    }
+
+    out
+}
+
+#[test]
+fn combinations_match_brute_force_oracle() {
+    let archive = archive(osmflat_extc::BuildOptions {
+        combinations: true,
+        ..Default::default()
+    });
+    let oracle = CombinationOracle::build(archive.parent());
+    let taginfo = archive.taginfo().expect("taginfo sub-archive present");
+
+    for key_view in taginfo.keys() {
+        let key = key_view.key().to_vec();
+        let got: Vec<(Key, u64)> = key_view
+            .combinations()
+            .map(|combo| (combo.key().to_vec(), combo.together_count()))
+            .collect();
+        let want = oracle.by_key.get(&key).cloned().unwrap_or_default();
+        assert_eq!(got, want, "combinations for key {key:?}");
+    }
+
+    let amenity = taginfo.key(b"amenity").expect("amenity key exists");
+    let combos: Vec<(Key, u64)> = amenity
+        .combinations()
+        .map(|combo| (combo.key().to_vec(), combo.together_count()))
+        .collect();
+    assert!(
+        combos
+            .iter()
+            .any(|(key, count)| key.as_slice() == b"name" && *count == 3),
+        "amenity should co-occur with name on three entities"
     );
 }
 

@@ -58,6 +58,9 @@ struct KeyEntry {
     /// Range of this key's distinct values in `values`.
     @range(values)
     value_first_idx: u64 : 40;
+    /// Range of other keys used by objects that have this key.
+    @range(combos)
+    combo_first_idx: u64 : 40;
 }
 
 /**
@@ -86,6 +89,14 @@ struct Ref {
     value: u64 : 40;
 }
 
+/// A key co-occurrence entry for taginfo combinations.
+struct ComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    other_key_idx: u64 : 40;
+    /// Number of parent entities carrying this key and `other_key_idx`.
+    together_count: u64 : 40;
+}
+
 /**
  * Inverted tag index and taginfo histograms.
  */
@@ -106,6 +117,11 @@ archive Taginfo {
     way_post: vector< Ref >;
     /// Per-(key,value) relation postings (ascending relation indices).
     rel_post: vector< Ref >;
+    /**
+     * Per-key co-occurring keys, sorted by descending together_count and then
+     * key string. Empty unless built with `osmflat-extc --combinations`.
+     */
+    combos: vector< ComboEntry >;
 }
 
 // ---------------------------------------------------------------------------

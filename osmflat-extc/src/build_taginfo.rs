@@ -16,6 +16,7 @@
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
 use osmflat_ext::TaginfoBuilder;
+use std::collections::HashMap;
 
 /// Per-type postings for one tag slot, ascending entity indices.
 #[derive(Default)]
@@ -29,7 +30,7 @@ struct SlotPostings {
 pub fn build(
     parent: &Osm,
     builder: &TaginfoBuilder,
-    _opts: &BuildOptions,
+    opts: &BuildOptions,
 ) -> Result<(), BuildError> {
     let n_tags = parent.tags().len();
     let mut postings: Vec<SlotPostings> = (0..n_tags).map(|_| SlotPostings::default()).collect();
@@ -43,8 +44,12 @@ pub fn build(
 
     // Phase 0 (after counting): group slots by key, sort keys/values by string.
     let dict = Dictionary::build(parent);
+    let combos = opts
+        .combinations
+        .then(|| Cooccurrences::build(parent))
+        .unwrap_or_default();
 
-    write(parent, builder, &dict, &postings)
+    write(parent, builder, &dict, &postings, &combos)
 }
 
 #[derive(Clone, Copy)]
@@ -124,6 +129,76 @@ impl Dictionary {
     }
 }
 
+#[derive(Default)]
+struct Cooccurrences {
+    by_key: HashMap<u64, Vec<Combo>>,
+}
+
+struct Combo {
+    other_key_idx: u64,
+    together_count: u64,
+}
+
+impl Cooccurrences {
+    fn build(parent: &Osm) -> Self {
+        let mut counts: HashMap<(u64, u64), u64> = HashMap::new();
+
+        for keys in entity_key_sets(parent) {
+            for &key_idx in &keys {
+                for &other_key_idx in &keys {
+                    if key_idx != other_key_idx {
+                        *counts.entry((key_idx, other_key_idx)).or_default() += 1;
+                    }
+                }
+            }
+        }
+
+        let strings = parent.stringtable();
+        let mut by_key: HashMap<u64, Vec<Combo>> = HashMap::new();
+        for ((key_idx, other_key_idx), together_count) in counts {
+            by_key.entry(key_idx).or_default().push(Combo {
+                other_key_idx,
+                together_count,
+            });
+        }
+
+        for combos in by_key.values_mut() {
+            combos.sort_by(|a, b| {
+                b.together_count.cmp(&a.together_count).then_with(|| {
+                    strings
+                        .substring_raw(a.other_key_idx as usize)
+                        .cmp(strings.substring_raw(b.other_key_idx as usize))
+                })
+            });
+        }
+
+        Self { by_key }
+    }
+}
+
+fn entity_key_sets(parent: &Osm) -> impl Iterator<Item = Vec<u64>> + '_ {
+    let node_tags = parent.nodes().iter().map(|node| node.tags());
+    let way_tags = parent.ways().iter().map(|way| way.tags());
+    let relation_tags = parent.relations().iter().map(|relation| relation.tags());
+    let tags = parent.tags();
+    let tags_index = parent.tags_index();
+
+    node_tags
+        .chain(way_tags)
+        .chain(relation_tags)
+        .map(move |range| {
+            let mut keys: Vec<u64> = range
+                .map(|tag_index_idx| {
+                    let tag_slot = tags_index[tag_index_idx as usize].value() as usize;
+                    tags[tag_slot].key_idx()
+                })
+                .collect();
+            keys.sort_unstable();
+            keys.dedup();
+            keys
+        })
+}
+
 /// Emit `keys` / `values` / `*_post` in dictionary order, closing each range
 /// with a trailing sentinel.
 fn write(
@@ -131,6 +206,7 @@ fn write(
     builder: &TaginfoBuilder,
     dict: &Dictionary,
     postings: &[SlotPostings],
+    combos: &Cooccurrences,
 ) -> Result<(), BuildError> {
     let tags = parent.tags();
 
@@ -139,9 +215,11 @@ fn write(
     let mut node_post = builder.start_node_post()?;
     let mut way_post = builder.start_way_post()?;
     let mut rel_post = builder.start_rel_post()?;
+    let mut combo_vec = builder.start_combos()?;
 
     let (mut values_written, mut nodes_written, mut ways_written, mut rels_written) =
         (0u64, 0u64, 0u64, 0u64);
+    let mut combos_written = 0u64;
 
     for group in &dict.keys {
         // Per-key aggregate counts (sum of value postings; keys unique per object).
@@ -159,6 +237,7 @@ fn write(
         key.set_count_ways(cw);
         key.set_count_relations(cr);
         key.set_value_first_idx(values_written);
+        key.set_combo_first_idx(combos_written);
 
         for &t in &group.slots {
             let p = &postings[t as usize];
@@ -182,12 +261,22 @@ fn write(
             rels_written += p.relations.len() as u64;
             values_written += 1;
         }
+
+        if let Some(entries) = combos.by_key.get(&group.key_idx) {
+            for entry in entries {
+                let combo = combo_vec.grow()?;
+                combo.set_other_key_idx(entry.other_key_idx);
+                combo.set_together_count(entry.together_count);
+                combos_written += 1;
+            }
+        }
     }
 
     // Sentinels close the last real key's value range and the last value's
     // postings ranges. flatdata trims these from the reader slices.
     let key_sentinel = keys_vec.grow()?;
     key_sentinel.set_value_first_idx(values_written);
+    key_sentinel.set_combo_first_idx(combos_written);
     let value_sentinel = values_vec.grow()?;
     value_sentinel.set_node_first_idx(nodes_written);
     value_sentinel.set_way_first_idx(ways_written);
@@ -198,5 +287,6 @@ fn write(
     node_post.close()?;
     way_post.close()?;
     rel_post.close()?;
+    combo_vec.close()?;
     Ok(())
 }

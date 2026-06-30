@@ -10,7 +10,7 @@
 //! All postings are ascending parent indices, i.e. spatial (SFC) order, so they
 //! compose with bbox queries and with each other via [`crate::query`].
 
-use crate::{KeyEntry, Ref, Taginfo, ValueEntry};
+use crate::{ComboEntry, KeyEntry, Ref, Taginfo, ValueEntry};
 use osmflat::Osm;
 
 /// Object counts split by entity type.
@@ -122,6 +122,16 @@ impl<'a> KeyView<'a> {
         r.end - r.start
     }
 
+    /// Other keys used by entities that carry this key.
+    ///
+    /// Entries are sorted by descending together-count, then by key string.
+    /// Empty when the sidecar was built without `--combinations`.
+    pub fn combinations(&self) -> impl Iterator<Item = CombinationView<'a>> + '_ {
+        let r = self.entry().combos();
+        let q = self.q;
+        (r.start..r.end).map(move |i| CombinationView { q, idx: i as usize })
+    }
+
     /// The distinct values for this key, sorted by value string.
     pub fn values(&self) -> impl Iterator<Item = ValueView<'a>> + '_ {
         let r = self.entry().values();
@@ -142,6 +152,32 @@ impl<'a> KeyView<'a> {
             q,
             idx: r.start as usize + off,
         })
+    }
+}
+
+/// A co-occurring key for a [`KeyView`].
+#[derive(Clone, Copy)]
+pub struct CombinationView<'a> {
+    q: TaginfoQuery<'a>,
+    idx: usize,
+}
+
+impl<'a> CombinationView<'a> {
+    #[inline]
+    fn entry(&self) -> &'a ComboEntry {
+        &self.q.taginfo.combos()[self.idx]
+    }
+
+    /// The co-occurring key string.
+    #[inline]
+    pub fn key(&self) -> &'a [u8] {
+        self.q.string(self.entry().other_key_idx())
+    }
+
+    /// Number of parent entities that carry both keys.
+    #[inline]
+    pub fn together_count(&self) -> u64 {
+        self.entry().together_count()
     }
 }
 

@@ -62,6 +62,8 @@ implemented and tested.**
 - `spatial::{nodes_within_radius,k_nearest_nodes,nodes_in_polygon}` provide
   node radius, nearest-neighbor, and polygon queries without an extension
   sidecar.
+- `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
+  keys, exposed through `KeyView::combinations`.
 - The fingerprint guard is wired into `ExtArchive::open`.
 
 All three are checked end-to-end by synthetic, in-memory tests behind
@@ -75,8 +77,8 @@ The tests build a parent `Osm` archive through `osmflat/test-support`, build the
 extension archive in memory, and validate taginfo, backrefs, and bbox
 merge-join results against brute-force oracles.
 
-Still incomplete: taginfo `--combinations`. Both sidecar builds are the in-RAM
-form; planet-scale mmap scratch is not yet wired up.
+Still incomplete: both sidecar builds are the in-RAM form; planet-scale mmap
+scratch is not yet wired up.
 
 The parent is a path dependency on `../osmflat-rs/osmflat` (the
 `feature/spatial-index` + `Ids` branch this is designed against).
