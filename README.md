@@ -30,19 +30,23 @@ osmflat-extc/        bin+lib: the compiler that builds sidecars
 
 ## Status
 
-**Phase 1 (Taginfo) is implemented and tested.** The compiler builds the
-inverted tag index + histograms (`osmflat-extc --taginfo`), the query side does
-key/value binary search + postings + the bbox merge-join, and the fingerprint
-guard is wired into `ExtArchive::open`. An end-to-end test
-(`osmflat-extc/tests/dc.rs`) builds the sidecar for the district-of-columbia
-archive and checks every key, value, and postings list against a brute-force
-oracle (2,123 keys / 200k (key,value) pairs). Run it with the sibling
-`osmflat-rs` checkout present, or point `OSMFLAT_DC_ARCHIVE` at an archive.
+**Phases 1 (Taginfo) and 2 (Backrefs) are implemented and tested.**
 
-Still stubbed (`todo!()`): the `Backrefs` build (`osmflat-extc/src/build_backrefs.rs`)
-and reader (`osmflat-ext/src/backrefs.rs`), non-bbox spatial
-(`osmflat-ext/src/spatial.rs`), and taginfo `--combinations`. The Taginfo build
-is the in-RAM form; planet-scale mmap scratch is not yet wired up.
+- `osmflat-extc --taginfo` builds the inverted tag index + histograms; the query
+  side does key/value binary search, postings, and the bbox merge-join.
+- `osmflat-extc --backrefs` builds node→ways and X→relations reverse indexes;
+  the query side slices them in O(deg).
+- The fingerprint guard is wired into `ExtArchive::open`.
+
+Both are checked end-to-end against the district-of-columbia archive by a
+brute-force oracle: `tests/dc.rs` (2,123 keys / 200k (key,value) pairs) and
+`tests/dc_backrefs.rs` (1.95M nodes / 283k ways / 5,265 relations / 2.3M
+node→way edges). Run with the sibling `osmflat-rs` checkout present, or point
+`OSMFLAT_DC_ARCHIVE` at an archive.
+
+Still stubbed (`todo!()`): non-bbox spatial (`osmflat-ext/src/spatial.rs`) and
+taginfo `--combinations`. Both sidecar builds are the in-RAM form; planet-scale
+mmap scratch is not yet wired up.
 
 The parent is a path dependency on `../osmflat-rs/osmflat` (the
 `feature/spatial-index` + `Ids` branch this is designed against).

@@ -66,6 +66,12 @@ impl<'a> BackrefsQuery<'a> {
 /// `Range::post()` reads the *next* element's `first_idx`, so a trailing
 /// sentinel must close the last real range.
 #[inline]
-fn slice_range<'a>(_ranges: &'a [crate::Range], _postings: &'a [Ref], _idx: usize) -> &'a [Ref] {
-    todo!("let r = ranges[idx].post(); &postings[r.start as usize..r.end as usize]")
+fn slice_range<'a>(ranges: &'a [crate::Range], postings: &'a [Ref], idx: usize) -> &'a [Ref] {
+    let Some(entry) = ranges.get(idx) else {
+        return &[];
+    };
+    let r = entry.post();
+    postings
+        .get(r.start as usize..r.end as usize)
+        .unwrap_or(&[])
 }
