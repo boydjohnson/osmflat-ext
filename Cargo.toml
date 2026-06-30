@@ -12,7 +12,7 @@ license = "MIT/Apache-2.0"
 repository = "https://github.com/boydjohnson/osmflat-ext"
 
 [workspace.dependencies]
-# The parent format. Path-pinned to the local checkout that carries the
-# `feature/spatial-index` + `Ids` work this crate is designed against.
-osmflat = { path = "../osmflat-rs/osmflat" }
+# The parent format. Pinned to the branch that carries the spatial-index + Ids
+# work this crate is designed against.
+osmflat = { git = "https://github.com/boydjohnson/osmflat-rs", branch = "feature/spatial-index" }
 flatdata = "0.5.3"

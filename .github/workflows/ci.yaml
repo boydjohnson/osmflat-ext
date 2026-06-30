@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - feature/**
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test, fmt, and build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout osmflat-ext
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Build crates
+        run: cargo build --workspace --all-features
+
+      - name: Build examples
+        run: cargo build --workspace --examples --all-features
+
+      - name: Test workspace
+        run: cargo test --workspace --all-features
