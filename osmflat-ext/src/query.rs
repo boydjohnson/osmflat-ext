@@ -10,7 +10,99 @@
 //! search that subrange inside the postings list — `O(R·log k)`.
 
 use crate::Ref;
+use osmflat::Osm;
 use std::ops::Range;
+
+/// A bounding box in degrees (`lon` = x, `lat` = y), matching the units of
+/// `osmflat::find_*_by_bounding_box`.
+#[derive(Clone, Copy, Debug)]
+pub struct Bbox {
+    pub min_lon: f64,
+    pub min_lat: f64,
+    pub max_lon: f64,
+    pub max_lat: f64,
+}
+
+/// Index of `item` within the contiguous slice `slice` it points into.
+///
+/// `osmflat::find_*_by_bounding_box` yields `&Node`/`&Way`/`&Relation`
+/// references into the archive's entity slice but not their indices; this
+/// recovers the index by offset. Sound because the references point into
+/// `slice` and the structs are `repr(transparent)` with a fixed size.
+#[inline]
+fn slice_index<T>(slice: &[T], item: &T) -> u64 {
+    let offset = (item as *const T as usize) - (slice.as_ptr() as usize);
+    (offset / std::mem::size_of::<T>()) as u64
+}
+
+/// Collect ascending, distinct parent indices, recovering each from a slice.
+fn sorted_indices<'a, T: 'a>(base: &[T], items: impl Iterator<Item = &'a T>) -> Vec<u64> {
+    let mut v: Vec<u64> = items.map(|it| slice_index(base, it)).collect();
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// Ascending node indices whose nodes fall in `bbox`, via osmflat's exact
+/// spatial query. Drift-free: the candidate ranges and exact-overlap filter are
+/// osmflat's own.
+pub fn node_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
+    let base = archive.nodes();
+    sorted_indices(
+        base,
+        osmflat::find_nodes_by_bounding_box(
+            archive,
+            bbox.min_lon,
+            bbox.min_lat,
+            bbox.max_lon,
+            bbox.max_lat,
+        ),
+    )
+}
+
+/// Ascending way indices overlapping `bbox`. See [`node_indices_in_bbox`].
+pub fn way_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
+    let base = archive.ways();
+    sorted_indices(
+        base,
+        osmflat::find_ways_by_bounding_box(
+            archive,
+            bbox.min_lon,
+            bbox.min_lat,
+            bbox.max_lon,
+            bbox.max_lat,
+        ),
+    )
+}
+
+/// Ascending relation indices overlapping `bbox`. See [`node_indices_in_bbox`].
+pub fn relation_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
+    let base = archive.relations();
+    sorted_indices(
+        base,
+        osmflat::find_relations_by_bounding_box(
+            archive,
+            bbox.min_lon,
+            bbox.min_lat,
+            bbox.max_lon,
+            bbox.max_lat,
+        ),
+    )
+}
+
+/// Run-length compress ascending, distinct indices into maximal `[start, end)`
+/// runs — the contiguous entity-index ranges that [`intersect_bbox`] consumes.
+/// A bbox result is mostly spatially contiguous, so this yields few ranges.
+pub fn to_index_ranges(sorted: &[u64]) -> Vec<Range<u64>> {
+    let mut out: Vec<Range<u64>> = Vec::new();
+    for &v in sorted {
+        match out.last_mut() {
+            Some(last) if last.end == v => last.end = v + 1,
+            _ => out.push(v..v + 1),
+        }
+    }
+    out
+}
 
 /// Intersect an ascending postings slice with the ascending, disjoint
 /// entity-index `ranges` from a bbox query. Yields parent indices in order.

@@ -28,6 +28,24 @@ osmflat-extc/        bin+lib: the compiler that builds sidecars
   src/build_backrefs.rs   2 CSR builds (node->ways, X->relations)
 ```
 
+## Examples
+
+Two runnable examples in `osmflat-ext/examples/` query a built sidecar (point
+them at a parent archive + its `Ext` dir):
+
+```text
+osmflat-extc --taginfo --backrefs --out dc.ext district-of-columbia.osmflat
+
+# taginfo browser (keys table / values table / key=value with example ids)
+cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext
+cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway
+cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway crossing
+
+# reverse references (OSM-id lookup needs the parent built with --reverse-ids)
+cargo run --example backrefs -- district-of-columbia.osmflat dc.ext node 281072
+cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 535462113
+```
+
 ## Status
 
 **Phases 1 (Taginfo) and 2 (Backrefs) are implemented and tested.**
@@ -36,13 +54,18 @@ osmflat-extc/        bin+lib: the compiler that builds sidecars
   side does key/value binary search, postings, and the bbox merge-join.
 - `osmflat-extc --backrefs` builds node→ways and X→relations reverse indexes;
   the query side slices them in O(deg).
+- `ValueView::{nodes,ways,relations}_in_bbox` compose a `key=value ∩ bbox`
+  merge-join: bbox candidates come from osmflat's own exact spatial query,
+  get run-length compressed to contiguous index ranges, and merge-join the tag
+  postings via `query::intersect_bbox` (`O(R·log k)`).
 - The fingerprint guard is wired into `ExtArchive::open`.
 
-Both are checked end-to-end against the district-of-columbia archive by a
-brute-force oracle: `tests/dc.rs` (2,123 keys / 200k (key,value) pairs) and
-`tests/dc_backrefs.rs` (1.95M nodes / 283k ways / 5,265 relations / 2.3M
-node→way edges). Run with the sibling `osmflat-rs` checkout present, or point
-`OSMFLAT_DC_ARCHIVE` at an archive.
+All three are checked end-to-end against the district-of-columbia archive:
+`tests/dc.rs` (taginfo, 2,123 keys / 200k (key,value) pairs vs. brute-force
+oracle), `tests/dc_backrefs.rs` (backrefs, 1.95M nodes / 2.3M node→way edges vs.
+oracle), and `tests/dc_bbox.rs` (the bbox merge-join, validated against an
+independent point-in-box scan). Run with the sibling `osmflat-rs` checkout
+present, or point `OSMFLAT_DC_ARCHIVE` at an archive.
 
 Still stubbed (`todo!()`): non-bbox spatial (`osmflat-ext/src/spatial.rs`) and
 taginfo `--combinations`. Both sidecar builds are the in-RAM form; planet-scale

@@ -193,4 +193,30 @@ impl<'a> ValueView<'a> {
         let r = self.entry().rel_post();
         &self.q.taginfo.rel_post()[r.start as usize..r.end as usize]
     }
+
+    /// Nodes with this `(key,value)` that fall in `bbox` — the
+    /// `key=value ∩ bbox` merge-join. Ascending node indices.
+    ///
+    /// Sources the bbox candidate ranges from osmflat's exact spatial query,
+    /// then runs the `O(R·log k)` range merge-join ([`crate::query::intersect_bbox`])
+    /// against this value's node postings.
+    pub fn nodes_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::node_indices_in_bbox(self.q.parent, bbox);
+        let ranges = crate::query::to_index_ranges(&idx);
+        crate::query::intersect_bbox(self.nodes(), &ranges).collect()
+    }
+
+    /// Ways with this `(key,value)` overlapping `bbox`. See [`Self::nodes_in_bbox`].
+    pub fn ways_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::way_indices_in_bbox(self.q.parent, bbox);
+        let ranges = crate::query::to_index_ranges(&idx);
+        crate::query::intersect_bbox(self.ways(), &ranges).collect()
+    }
+
+    /// Relations with this `(key,value)` overlapping `bbox`. See [`Self::nodes_in_bbox`].
+    pub fn relations_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::relation_indices_in_bbox(self.q.parent, bbox);
+        let ranges = crate::query::to_index_ranges(&idx);
+        crate::query::intersect_bbox(self.relations(), &ranges).collect()
+    }
 }
