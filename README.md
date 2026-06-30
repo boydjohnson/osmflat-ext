@@ -10,7 +10,7 @@ order, the postings in this archive (ascending parent indices) are already
 spatially ordered, so a `key=value` postings list merge-joins directly with a
 bbox query.
 
-Full design: [`osmflat-ext-design.md`](../osmflat-ext-design.md).
+Full design: [`osmflat-ext-design.md`](./osmflat-ext-design.md).
 
 ## Layout
 
@@ -54,10 +54,7 @@ cargo run --example spatial -- district-of-columbia.osmflat nearest -77.0365 38.
 cargo run --example spatial -- district-of-columbia.osmflat polygon -77.04 38.89 -77.01 38.89 -77.01 38.91 -77.04 38.91
 ```
 
-## Status
-
-**Phases 1 (Taginfo) and 2 (Backrefs), plus non-bbox node spatial queries, are
-implemented and tested.**
+## Implemented
 
 - `osmflat-extc --taginfo` builds the inverted tag index + histograms; the query
   side does key/value binary search, postings, and the bbox merge-join.
@@ -75,19 +72,27 @@ implemented and tested.**
   (`ValueView::combinations`).
 - The fingerprint guard is wired into `ExtArchive::open`.
 
-All three are checked end-to-end by synthetic, in-memory tests behind
-`test-support`:
+The sidecar compiler has a `test-support` feature that builds synthetic parent
+archives through `osmflat/test-support`, then builds extension archives in
+memory. These tests validate taginfo, combinations, backrefs, spatial helpers,
+and bbox merge-join results against brute-force oracles:
 
 ```sh
 cargo test -p osmflat-extc --features test-support
 ```
 
-The tests build a parent `Osm` archive through `osmflat/test-support`, build the
-extension archive in memory, and validate taginfo, backrefs, and bbox
-merge-join results against brute-force oracles.
+For the whole workspace:
 
-Still incomplete: both sidecar builds are the in-RAM form; planet-scale mmap
-scratch is not yet wired up.
+```sh
+cargo test --workspace --all-features
+cargo build --workspace --examples --all-features
+```
+
+## Current Limitation
+
+Both sidecar builds currently use the in-RAM builder path. The
+`--mmap-scratch` option is reserved for a planet-scale postings build path but
+is not wired up yet.
 
 The parent `osmflat` crate is resolved from the `feature/spatial-index` branch
 of <https://github.com/boydjohnson/osmflat-rs>.
