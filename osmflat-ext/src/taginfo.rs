@@ -10,7 +10,7 @@
 //! All postings are ascending parent indices, i.e. spatial (SFC) order, so they
 //! compose with bbox queries and with each other via [`crate::query`].
 
-use crate::{ComboEntry, KeyEntry, Ref, Taginfo, ValueEntry};
+use crate::{ComboEntry, KeyEntry, Ref, TagComboEntry, Taginfo, ValueEntry};
 use osmflat::Osm;
 
 /// Object counts split by entity type.
@@ -181,6 +181,38 @@ impl<'a> CombinationView<'a> {
     }
 }
 
+/// A co-occurring tag for a [`ValueView`].
+#[derive(Clone, Copy)]
+pub struct TagCombinationView<'a> {
+    q: TaginfoQuery<'a>,
+    idx: usize,
+}
+
+impl<'a> TagCombinationView<'a> {
+    #[inline]
+    fn entry(&self) -> &'a TagComboEntry {
+        &self.q.taginfo.tag_combos()[self.idx]
+    }
+
+    /// The co-occurring key string.
+    #[inline]
+    pub fn key(&self) -> &'a [u8] {
+        self.q.string(self.entry().other_key_idx())
+    }
+
+    /// The co-occurring value string.
+    #[inline]
+    pub fn value(&self) -> &'a [u8] {
+        self.q.string(self.entry().other_value_idx())
+    }
+
+    /// Number of parent entities that carry both tags.
+    #[inline]
+    pub fn together_count(&self) -> u64 {
+        self.entry().together_count()
+    }
+}
+
 /// A `(key, value)` with its per-type postings.
 #[derive(Clone, Copy)]
 pub struct ValueView<'a> {
@@ -207,6 +239,16 @@ impl<'a> ValueView<'a> {
             ways: self.ways().len() as u64,
             relations: self.relations().len() as u64,
         }
+    }
+
+    /// Other tags used by entities that carry this exact `(key,value)`.
+    ///
+    /// Entries are sorted by descending together-count, then by key string and
+    /// value string. Empty when the sidecar was built without `--combinations`.
+    pub fn combinations(&self) -> impl Iterator<Item = TagCombinationView<'a>> + '_ {
+        let r = self.entry().tag_combos();
+        let q = self.q;
+        (r.start..r.end).map(move |i| TagCombinationView { q, idx: i as usize })
     }
 
     /// Node postings (ascending parent node indices).

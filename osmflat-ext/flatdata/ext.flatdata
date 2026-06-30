@@ -82,6 +82,9 @@ struct ValueEntry {
     way_first_idx: u64 : 40;
     @range(rel_post)
     rel_first_idx: u64 : 40;
+    /// Range of other tags used by objects that have this exact key=value.
+    @range(tag_combos)
+    tag_combo_first_idx: u64 : 40;
 }
 
 /// A reference into the parent `nodes` / `ways` / `relations` vector.
@@ -94,6 +97,16 @@ struct ComboEntry {
     /// Other key string, index into the parent `Osm.stringtable`.
     other_key_idx: u64 : 40;
     /// Number of parent entities carrying this key and `other_key_idx`.
+    together_count: u64 : 40;
+}
+
+/// A tag co-occurrence entry for taginfo combinations.
+struct TagComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    other_key_idx: u64 : 40;
+    /// Other value string, index into the parent `Osm.stringtable`.
+    other_value_idx: u64 : 40;
+    /// Number of parent entities carrying this tag and the other tag.
     together_count: u64 : 40;
 }
 
@@ -122,6 +135,11 @@ archive Taginfo {
      * key string. Empty unless built with `osmflat-extc --combinations`.
      */
     combos: vector< ComboEntry >;
+    /**
+     * Per-tag co-occurring tags, sorted by descending together_count and then
+     * key/value string. Empty unless built with `osmflat-extc --combinations`.
+     */
+    tag_combos: vector< TagComboEntry >;
 }
 
 // ---------------------------------------------------------------------------

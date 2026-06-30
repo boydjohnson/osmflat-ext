@@ -405,22 +405,22 @@ impl KeyEntry {
 /// they equal the corresponding postings range length.
 #[repr(transparent)]
 pub struct ValueEntry {
-    data: [u8; 20],
+    data: [u8; 25],
 }
 
 impl ValueEntry {
     /// Unsafe since the struct might not be self-contained
     pub unsafe fn new_unchecked( ) -> Self {
-        Self{data : [0; 20]}
+        Self{data : [0; 25]}
     }
 }
 
 impl flatdata::Struct for ValueEntry {
     unsafe fn create_unchecked( ) -> Self {
-        Self{data : [0; 20]}
+        Self{data : [0; 25]}
     }
 
-    const SIZE_IN_BYTES: usize = 20;
+    const SIZE_IN_BYTES: usize = 25;
     const IS_OVERLAPPING_WITH_NEXT : bool = true;
 }
 
@@ -449,7 +449,7 @@ impl ValueEntry {
     #[inline]
     pub fn node_post(&self) -> std::ops::Range<u64> {
         let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 40, 40);
-        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 40 + 20 * 8, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 40 + 25 * 8, 40);
         start..end
     }
 
@@ -465,7 +465,7 @@ impl ValueEntry {
     #[inline]
     pub fn way_post(&self) -> std::ops::Range<u64> {
         let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 80, 40);
-        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 80 + 20 * 8, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 80 + 25 * 8, 40);
         start..end
     }
 
@@ -481,7 +481,24 @@ impl ValueEntry {
     #[inline]
     pub fn rel_post(&self) -> std::ops::Range<u64> {
         let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 120, 40);
-        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 120 + 20 * 8, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 120 + 25 * 8, 40);
+        start..end
+    }
+
+    /// First element of the range [`tag_combos`].
+    ///
+    /// [`tag_combos`]: #method.tag_combos
+    #[inline]
+    pub fn tag_combo_first_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 160, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Range of other tags used by objects that have this exact key=value.
+    #[inline]
+    pub fn tag_combos(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 160, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 160 + 25 * 8, 40);
         start..end
     }
 
@@ -494,6 +511,7 @@ impl std::fmt::Debug for ValueEntry {
             .field("node_first_idx", &self.node_first_idx())
             .field("way_first_idx", &self.way_first_idx())
             .field("rel_first_idx", &self.rel_first_idx())
+            .field("tag_combo_first_idx", &self.tag_combo_first_idx())
             .finish()
     }
 }
@@ -501,7 +519,7 @@ impl std::fmt::Debug for ValueEntry {
 impl std::cmp::PartialEq for ValueEntry {
     #[inline]
     fn eq(&self, other: &Self) -> bool {
-        self.value_idx() == other.value_idx() &&        self.node_first_idx() == other.node_first_idx() &&        self.way_first_idx() == other.way_first_idx() &&        self.rel_first_idx() == other.rel_first_idx()     }
+        self.value_idx() == other.value_idx() &&        self.node_first_idx() == other.node_first_idx() &&        self.way_first_idx() == other.way_first_idx() &&        self.rel_first_idx() == other.rel_first_idx() &&        self.tag_combo_first_idx() == other.tag_combo_first_idx()     }
 }
 
 impl ValueEntry {
@@ -539,6 +557,15 @@ impl ValueEntry {
         flatdata_write_bytes!(u64; value, self.data, 120, 40)
     }
 
+    /// First element of the range [`tag_combos`].
+    ///
+    /// [`tag_combos`]: struct.ValueEntryRef.html#method.tag_combos
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_tag_combo_first_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 160, 40)
+    }
+
 
     /// Copies the data from `other` into this struct.
     #[inline]
@@ -547,6 +574,7 @@ impl ValueEntry {
         self.set_node_first_idx(other.node_first_idx());
         self.set_way_first_idx(other.way_first_idx());
         self.set_rel_first_idx(other.rel_first_idx());
+        self.set_tag_combo_first_idx(other.tag_combo_first_idx());
     }
 }
 /// A reference into the parent `nodes` / `ways` / `relations` vector.
@@ -795,6 +823,154 @@ impl ComboEntry {
         self.set_together_count(other.together_count());
     }
 }
+/// A tag co-occurrence entry for taginfo combinations.
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct TagComboEntry {
+    data: [u8; 15],
+}
+
+impl TagComboEntry {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 15]}
+    }
+}
+
+impl flatdata::Struct for TagComboEntry {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 15]}
+    }
+
+    const SIZE_IN_BYTES: usize = 15;
+    const IS_OVERLAPPING_WITH_NEXT : bool = false;
+}
+
+impl TagComboEntry {
+    pub fn new( ) -> Self {
+        Self{data : [0; 15]}
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes(data: &[u8; 15]) -> &Self {
+        // Safety: This is safe since TagComboEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes_mut(data: &mut [u8; 15]) -> &mut Self {
+        // Safety: This is safe since TagComboEntry is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice(data: &[u8]) -> Result<&Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 15 {
+            assert_eq!(data.len(), 15);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *const [u8; 15];
+        // Safety: We checked length before
+        Ok(Self::from_bytes(unsafe { &*ptr }))
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice_mut(data: &mut [u8]) -> Result<&mut Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 15 {
+            assert_eq!(data.len(), 15);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *mut [u8; 15];
+        // Safety: We checked length before
+        Ok(Self::from_bytes_mut(unsafe { &mut *ptr }))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 15] {
+        &self.data
+    }
+}
+
+impl Default for TagComboEntry {
+    fn default( ) -> Self {
+        Self::new( )
+    }
+}
+
+unsafe impl flatdata::NoOverlap for TagComboEntry {}
+
+impl TagComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    #[inline]
+    pub fn other_key_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 0, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Other value string, index into the parent `Osm.stringtable`.
+    #[inline]
+    pub fn other_value_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 40, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Number of parent entities carrying this tag and the other tag.
+    #[inline]
+    pub fn together_count(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 80, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+}
+
+impl std::fmt::Debug for TagComboEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("TagComboEntry")
+            .field("other_key_idx", &self.other_key_idx())
+            .field("other_value_idx", &self.other_value_idx())
+            .field("together_count", &self.together_count())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for TagComboEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.other_key_idx() == other.other_key_idx() &&        self.other_value_idx() == other.other_value_idx() &&        self.together_count() == other.together_count()     }
+}
+
+impl TagComboEntry {
+    /// Other key string, index into the parent `Osm.stringtable`.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_other_key_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 0, 40)
+    }
+
+    /// Other value string, index into the parent `Osm.stringtable`.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_other_value_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 40, 40)
+    }
+
+    /// Number of parent entities carrying this tag and the other tag.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_together_count(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 80, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &TagComboEntry) {
+        self.set_other_key_idx(other.other_key_idx());
+        self.set_other_value_idx(other.other_value_idx());
+        self.set_together_count(other.together_count());
+    }
+}
 /// Generic 1:n range holder, one per parent entity, parallel to a parent vector.
 #[repr(transparent)]
 pub struct Range {
@@ -882,6 +1058,7 @@ pub struct Taginfo {
     way_post : &'static [super::osm_ext::Ref],
     rel_post : &'static [super::osm_ext::Ref],
     combos : &'static [super::osm_ext::ComboEntry],
+    tag_combos : &'static [super::osm_ext::TagComboEntry],
 }
 
 impl Taginfo {
@@ -928,6 +1105,13 @@ impl Taginfo {
         self.combos
     }
 
+    /// Per-tag co-occurring tags, sorted by descending together_count and then
+/// key/value string. Empty unless built with `osmflat-extc --combinations`.
+    #[inline]
+    pub fn tag_combos(&self) -> &[super::osm_ext::TagComboEntry] {
+        self.tag_combos
+    }
+
 }
 
 impl ::std::fmt::Debug for Taginfo {
@@ -939,6 +1123,7 @@ impl ::std::fmt::Debug for Taginfo {
             .field("way_post", &self.way_post())
             .field("rel_post", &self.rel_post())
             .field("combos", &self.combos())
+            .field("tag_combos", &self.tag_combos())
             .finish()
     }
 }
@@ -993,6 +1178,12 @@ impl Taginfo {
             let resource = extend(storage.read("combos", schema::taginfo::resources::COMBOS));
             check("combos", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::ComboEntry]>::from_bytes(x)))?
         };
+        let tag_combos = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("tag_combos", schema::taginfo::resources::TAG_COMBOS));
+            check("tag_combos", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::TagComboEntry]>::from_bytes(x)))?
+        };
 
         Ok(Self {
             _storage: storage,
@@ -1002,6 +1193,7 @@ impl Taginfo {
             way_post,
             rel_post,
             combos,
+            tag_combos,
         })
     }
 }
@@ -1145,6 +1337,28 @@ impl TaginfoBuilder {
     #[inline]
     pub fn start_combos(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::ComboEntry>> {
         flatdata::create_external_vector(&*self.storage, "combos", schema::taginfo::resources::COMBOS)
+    }
+
+    #[inline]
+    /// Stores [`tag_combos`] in the archive.
+    ///
+    /// [`tag_combos`]: struct.Taginfo.html#method.tag_combos
+    pub fn set_tag_combos(&self, vector: &[super::osm_ext::TagComboEntry]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("tag_combos", schema::taginfo::resources::TAG_COMBOS, vector.as_bytes())
+    }
+
+    /// Opens [`tag_combos`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`tag_combos`]: struct.Taginfo.html#method.tag_combos
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_tag_combos(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::TagComboEntry>> {
+        flatdata::create_external_vector(&*self.storage, "tag_combos", schema::taginfo::resources::TAG_COMBOS)
     }
 
 }
@@ -1706,6 +1920,8 @@ struct ValueEntry
     way_first_idx : u64 : 40;
     @range( rel_post )
     rel_first_idx : u64 : 40;
+    @range( tag_combos )
+    tag_combo_first_idx : u64 : 40;
 }
 }
 
@@ -1725,6 +1941,15 @@ struct ComboEntry
 }
 
 namespace osm_ext {
+struct TagComboEntry
+{
+    other_key_idx : u64 : 40;
+    other_value_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -1737,6 +1962,7 @@ archive Taginfo
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
+    tag_combos : vector< .osm_ext.TagComboEntry >;
 }
 }
 
@@ -1775,6 +2001,8 @@ struct ValueEntry
     way_first_idx : u64 : 40;
     @range( rel_post )
     rel_first_idx : u64 : 40;
+    @range( tag_combos )
+    tag_combo_first_idx : u64 : 40;
 }
 }
 
@@ -1843,6 +2071,23 @@ namespace osm_ext {
 archive Taginfo
 {
     combos : vector< .osm_ext.ComboEntry >;
+}
+}
+
+"#;
+pub const TAG_COMBOS: &str = r#"namespace osm_ext {
+struct TagComboEntry
+{
+    other_key_idx : u64 : 40;
+    other_value_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Taginfo
+{
+    tag_combos : vector< .osm_ext.TagComboEntry >;
 }
 }
 
@@ -2053,6 +2298,8 @@ struct ValueEntry
     way_first_idx : u64 : 40;
     @range( rel_post )
     rel_first_idx : u64 : 40;
+    @range( tag_combos )
+    tag_combo_first_idx : u64 : 40;
 }
 }
 
@@ -2072,6 +2319,15 @@ struct ComboEntry
 }
 
 namespace osm_ext {
+struct TagComboEntry
+{
+    other_key_idx : u64 : 40;
+    other_value_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -2084,6 +2340,7 @@ archive Taginfo
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
+    tag_combos : vector< .osm_ext.TagComboEntry >;
 }
 }
 
@@ -2180,6 +2437,8 @@ struct ValueEntry
     way_first_idx : u64 : 40;
     @range( rel_post )
     rel_first_idx : u64 : 40;
+    @range( tag_combos )
+    tag_combo_first_idx : u64 : 40;
 }
 }
 
@@ -2199,6 +2458,15 @@ struct ComboEntry
 }
 
 namespace osm_ext {
+struct TagComboEntry
+{
+    other_key_idx : u64 : 40;
+    other_value_idx : u64 : 40;
+    together_count : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
 }
 
@@ -2211,6 +2479,7 @@ archive Taginfo
     way_post : vector< .osm_ext.Ref >;
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
+    tag_combos : vector< .osm_ext.TagComboEntry >;
 }
 }
 

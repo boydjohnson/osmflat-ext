@@ -23,7 +23,7 @@ struct Args {
     #[arg(long)]
     backrefs: bool,
 
-    /// Also build taginfo key co-occurrence (phase 2; implies --taginfo).
+    /// Also build taginfo key and tag co-occurrence (implies --taginfo).
     #[arg(long)]
     combinations: bool,
 
