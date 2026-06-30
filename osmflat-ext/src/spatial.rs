@@ -7,28 +7,42 @@
 
 use osmflat::Osm;
 
-/// A geographic point in scaled archive coordinates (`* header.coord_scale`).
+/// A geographic point in degrees (`lon` = x, `lat` = y).
 #[derive(Debug, Clone, Copy)]
-pub struct ScaledPoint {
-    pub lon: i32,
-    pub lat: i32,
+pub struct Point {
+    pub lon: f64,
+    pub lat: f64,
 }
 
-/// Node indices within `radius` (scaled units) of `center`, nearest-first.
+#[derive(Debug, Clone, Copy)]
+struct ScaledPoint {
+    lon: i32,
+    lat: i32,
+}
+
+/// Node indices within `radius` degrees of `center`, nearest-first.
 ///
 /// Uses the parent archive's bbox query as a prefilter, then refines by exact
 /// squared distance in archive coordinate units.
 pub fn nodes_within_radius(
     archive: &Osm,
-    center: ScaledPoint,
-    radius: i64,
+    center_lon: f64,
+    center_lat: f64,
+    radius: f64,
 ) -> impl Iterator<Item = usize> {
-    if radius < 0 {
+    if radius < 0.0 || !center_lon.is_finite() || !center_lat.is_finite() || !radius.is_finite() {
         return Vec::new().into_iter();
     }
 
-    let radius_sq = square(radius);
-    let bbox = bbox_around(center, radius, archive.header().coord_scale());
+    let coord_scale = archive.header().coord_scale();
+    let center = scale_point(center_lon, center_lat, coord_scale);
+    let radius_scaled = scale_radius(radius, coord_scale);
+    let radius_sq = square(radius_scaled as i64);
+    let bbox = bbox_around(
+        center_lon,
+        center_lat,
+        radius_scaled as f64 / coord_scale as f64,
+    );
     let mut matches: Vec<(i128, usize)> = crate::query::node_indices_in_bbox(archive, bbox)
         .into_iter()
         .filter_map(|idx| {
@@ -45,7 +59,7 @@ pub fn nodes_within_radius(
         })
         .collect();
 
-    matches.sort_by_key(|&(dist, idx)| (dist, idx));
+    matches.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     matches
         .into_iter()
         .map(|(_, idx)| idx)
@@ -57,11 +71,12 @@ pub fn nodes_within_radius(
 ///
 /// This exact implementation scans all nodes and sorts by distance; the
 /// expanding-ring optimization can replace it without changing results.
-pub fn k_nearest_nodes(archive: &Osm, center: ScaledPoint, k: usize) -> Vec<usize> {
-    if k == 0 {
+pub fn k_nearest_nodes(archive: &Osm, center_lon: f64, center_lat: f64, k: usize) -> Vec<usize> {
+    if k == 0 || !center_lon.is_finite() || !center_lat.is_finite() {
         return Vec::new();
     }
 
+    let center = scale_point(center_lon, center_lat, archive.header().coord_scale());
     let mut nodes: Vec<(i128, usize)> = archive
         .nodes()
         .iter()
@@ -80,19 +95,28 @@ pub fn k_nearest_nodes(archive: &Osm, center: ScaledPoint, k: usize) -> Vec<usiz
         })
         .collect();
 
-    nodes.sort_by_key(|&(dist, idx)| (dist, idx));
+    nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     nodes.into_iter().take(k).map(|(_, idx)| idx).collect()
 }
 
-/// Node indices inside the `polygon` (scaled ring, lon/lat).
+/// Node indices inside the `polygon` ring, in degrees (`lon` = x, `lat` = y).
 ///
 /// Bbox-of-polygon prefilter via the spatial query, then exact point-in-polygon.
-pub fn nodes_in_polygon(archive: &Osm, polygon: &[ScaledPoint]) -> impl Iterator<Item = usize> {
-    if polygon.len() < 3 {
+pub fn nodes_in_polygon(archive: &Osm, polygon: &[Point]) -> impl Iterator<Item = usize> {
+    if polygon.len() < 3
+        || polygon
+            .iter()
+            .any(|p| !p.lon.is_finite() || !p.lat.is_finite())
+    {
         return Vec::new().into_iter();
     }
 
-    let bbox = polygon_bbox(polygon, archive.header().coord_scale());
+    let coord_scale = archive.header().coord_scale();
+    let scaled_polygon: Vec<ScaledPoint> = polygon
+        .iter()
+        .map(|p| scale_point(p.lon, p.lat, coord_scale))
+        .collect();
+    let bbox = polygon_bbox(polygon);
     crate::query::node_indices_in_bbox(archive, bbox)
         .into_iter()
         .filter_map(|idx| {
@@ -103,7 +127,7 @@ pub fn nodes_in_polygon(archive: &Osm, polygon: &[ScaledPoint]) -> impl Iterator
                     lon: node.lon(),
                     lat: node.lat(),
                 },
-                polygon,
+                &scaled_polygon,
             )
             .then_some(idx)
         })
@@ -111,16 +135,16 @@ pub fn nodes_in_polygon(archive: &Osm, polygon: &[ScaledPoint]) -> impl Iterator
         .into_iter()
 }
 
-fn bbox_around(center: ScaledPoint, radius: i64, coord_scale: i32) -> crate::query::Bbox {
+fn bbox_around(center_lon: f64, center_lat: f64, radius: f64) -> crate::query::Bbox {
     crate::query::Bbox {
-        min_lon: scaled_to_degrees((center.lon as i64).saturating_sub(radius), coord_scale),
-        min_lat: scaled_to_degrees((center.lat as i64).saturating_sub(radius), coord_scale),
-        max_lon: scaled_to_degrees((center.lon as i64).saturating_add(radius), coord_scale),
-        max_lat: scaled_to_degrees((center.lat as i64).saturating_add(radius), coord_scale),
+        min_lon: center_lon - radius,
+        min_lat: center_lat - radius,
+        max_lon: center_lon + radius,
+        max_lat: center_lat + radius,
     }
 }
 
-fn polygon_bbox(polygon: &[ScaledPoint], coord_scale: i32) -> crate::query::Bbox {
+fn polygon_bbox(polygon: &[Point]) -> crate::query::Bbox {
     let (mut min_lon, mut min_lat, mut max_lon, mut max_lat) = (
         polygon[0].lon,
         polygon[0].lat,
@@ -135,16 +159,29 @@ fn polygon_bbox(polygon: &[ScaledPoint], coord_scale: i32) -> crate::query::Bbox
     }
 
     crate::query::Bbox {
-        min_lon: scaled_to_degrees(min_lon as i64, coord_scale),
-        min_lat: scaled_to_degrees(min_lat as i64, coord_scale),
-        max_lon: scaled_to_degrees(max_lon as i64, coord_scale),
-        max_lat: scaled_to_degrees(max_lat as i64, coord_scale),
+        min_lon,
+        min_lat,
+        max_lon,
+        max_lat,
     }
 }
 
 #[inline]
-fn scaled_to_degrees(value: i64, coord_scale: i32) -> f64 {
-    value as f64 / coord_scale as f64
+fn scale_point(lon: f64, lat: f64, coord_scale: i32) -> ScaledPoint {
+    ScaledPoint {
+        lon: scale_coordinate(lon, coord_scale),
+        lat: scale_coordinate(lat, coord_scale),
+    }
+}
+
+#[inline]
+fn scale_coordinate(value: f64, coord_scale: i32) -> i32 {
+    (value * coord_scale as f64) as i32
+}
+
+#[inline]
+fn scale_radius(radius: f64, coord_scale: i32) -> i32 {
+    (radius * coord_scale as f64).ceil() as i32
 }
 
 #[inline]

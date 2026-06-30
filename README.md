@@ -62,8 +62,8 @@ implemented and tested.**
   get run-length compressed to contiguous index ranges, and merge-join the tag
   postings via `query::intersect_bbox` (`O(R·log k)`).
 - `spatial::{nodes_within_radius,k_nearest_nodes,nodes_in_polygon}` provide
-  node radius, nearest-neighbor, and polygon queries without an extension
-  sidecar.
+  node radius, nearest-neighbor, and polygon queries with `f64` lon/lat
+  arguments and no extension sidecar.
 - `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
   keys, exposed through `KeyView::combinations`.
 - The fingerprint guard is wired into `ExtArchive::open`.

@@ -1,8 +1,8 @@
 #![cfg(feature = "test-support")]
 
-use osmflat::test_support::{build_archive, scale};
+use osmflat::test_support::build_archive;
 use osmflat::Osm;
-use osmflat_ext::spatial::{k_nearest_nodes, nodes_in_polygon, nodes_within_radius, ScaledPoint};
+use osmflat_ext::spatial::{k_nearest_nodes, nodes_in_polygon, nodes_within_radius, Point};
 
 fn archive() -> Osm {
     build_archive(
@@ -19,35 +19,32 @@ fn archive() -> Osm {
     )
 }
 
-fn point(lon: f64, lat: f64) -> ScaledPoint {
-    ScaledPoint {
-        lon: scale(lon),
-        lat: scale(lat),
-    }
-}
-
-fn distance_sq(a: ScaledPoint, b: ScaledPoint) -> i128 {
-    let dx = a.lon as i128 - b.lon as i128;
-    let dy = a.lat as i128 - b.lat as i128;
+fn distance_sq(a: Point, b: Point) -> f64 {
+    let dx = a.lon - b.lon;
+    let dy = a.lat - b.lat;
     dx * dx + dy * dy
 }
 
-fn node_point(archive: &Osm, idx: usize) -> ScaledPoint {
+fn node_point(archive: &Osm, idx: usize) -> Point {
     let node = &archive.nodes()[idx];
-    ScaledPoint {
-        lon: node.lon(),
-        lat: node.lat(),
+    let scale = archive.header().coord_scale() as f64;
+    Point {
+        lon: node.lon() as f64 / scale,
+        lat: node.lat() as f64 / scale,
     }
 }
 
 #[test]
 fn nodes_within_radius_matches_exact_scan_nearest_first() {
     let archive = archive();
-    let center = point(-77.025, 38.902);
-    let radius = scale(0.011) as i64;
-    let radius_sq = (radius as i128) * (radius as i128);
+    let center = Point {
+        lon: -77.025,
+        lat: 38.902,
+    };
+    let radius = 0.011;
+    let radius_sq = radius * radius;
 
-    let mut expected: Vec<(i128, usize)> = archive
+    let mut expected: Vec<(f64, usize)> = archive
         .nodes()
         .iter()
         .enumerate()
@@ -56,30 +53,38 @@ fn nodes_within_radius_matches_exact_scan_nearest_first() {
             (dist <= radius_sq).then_some((dist, idx))
         })
         .collect();
-    expected.sort_by_key(|&(dist, idx)| (dist, idx));
+    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
     let expected: Vec<usize> = expected.into_iter().map(|(_, idx)| idx).collect();
 
-    let got: Vec<usize> = nodes_within_radius(&archive, center, radius).collect();
+    let got: Vec<usize> = nodes_within_radius(&archive, center.lon, center.lat, radius).collect();
     assert_eq!(got, expected);
-    assert!(nodes_within_radius(&archive, center, -1).next().is_none());
+    assert!(nodes_within_radius(&archive, center.lon, center.lat, -1.0)
+        .next()
+        .is_none());
 }
 
 #[test]
 fn k_nearest_nodes_matches_exact_scan() {
     let archive = archive();
-    let center = point(-77.024, 38.901);
+    let center = Point {
+        lon: -77.024,
+        lat: 38.901,
+    };
 
-    let mut expected: Vec<(i128, usize)> = archive
+    let mut expected: Vec<(f64, usize)> = archive
         .nodes()
         .iter()
         .enumerate()
         .map(|(idx, _)| (distance_sq(center, node_point(&archive, idx)), idx))
         .collect();
-    expected.sort_by_key(|&(dist, idx)| (dist, idx));
+    expected.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
 
-    assert_eq!(k_nearest_nodes(&archive, center, 0), Vec::<usize>::new());
     assert_eq!(
-        k_nearest_nodes(&archive, center, 3),
+        k_nearest_nodes(&archive, center.lon, center.lat, 0),
+        Vec::<usize>::new()
+    );
+    assert_eq!(
+        k_nearest_nodes(&archive, center.lon, center.lat, 3),
         expected
             .iter()
             .take(3)
@@ -87,7 +92,7 @@ fn k_nearest_nodes_matches_exact_scan() {
             .collect::<Vec<_>>()
     );
     assert_eq!(
-        k_nearest_nodes(&archive, center, archive.nodes().len() + 10),
+        k_nearest_nodes(&archive, center.lon, center.lat, archive.nodes().len() + 10),
         expected.iter().map(|&(_, idx)| idx).collect::<Vec<_>>()
     );
 }
@@ -96,21 +101,34 @@ fn k_nearest_nodes_matches_exact_scan() {
 fn nodes_in_polygon_matches_rectangle_scan_and_includes_boundary() {
     let archive = archive();
     let polygon = [
-        point(-77.030, 38.895),
-        point(-77.015, 38.895),
-        point(-77.015, 38.905),
-        point(-77.030, 38.905),
+        Point {
+            lon: -77.030,
+            lat: 38.895,
+        },
+        Point {
+            lon: -77.015,
+            lat: 38.895,
+        },
+        Point {
+            lon: -77.015,
+            lat: 38.905,
+        },
+        Point {
+            lon: -77.030,
+            lat: 38.905,
+        },
     ];
 
     let expected: Vec<usize> = archive
         .nodes()
         .iter()
         .enumerate()
-        .filter_map(|(idx, node)| {
-            (node.lon() >= polygon[0].lon
-                && node.lon() <= polygon[1].lon
-                && node.lat() >= polygon[0].lat
-                && node.lat() <= polygon[2].lat)
+        .filter_map(|(idx, _)| {
+            let point = node_point(&archive, idx);
+            (point.lon >= polygon[0].lon
+                && point.lon <= polygon[1].lon
+                && point.lat >= polygon[0].lat
+                && point.lat <= polygon[2].lat)
                 .then_some(idx)
         })
         .collect();
