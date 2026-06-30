@@ -18,3 +18,4 @@ default = []
 # Re-exports the builder side of the generated bindings + small synthetic-archive
 # helpers, so `osmflat-extc` and integration tests can construct sidecars.
 build-support = []
+test-support = ["build-support", "osmflat/test-support"]

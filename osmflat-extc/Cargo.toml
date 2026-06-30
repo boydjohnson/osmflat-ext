@@ -19,3 +19,7 @@ osmflat-ext = { path = "../osmflat-ext", features = ["build-support"] }
 osmflat.workspace = true
 flatdata.workspace = true
 clap = { version = "4.1", features = ["derive"] }
+
+[features]
+default = []
+test-support = ["osmflat/test-support", "osmflat-ext/test-support"]

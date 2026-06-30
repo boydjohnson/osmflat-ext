@@ -60,12 +60,16 @@ cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 53546211
   postings via `query::intersect_bbox` (`O(R·log k)`).
 - The fingerprint guard is wired into `ExtArchive::open`.
 
-All three are checked end-to-end against the district-of-columbia archive:
-`tests/dc.rs` (taginfo, 2,123 keys / 200k (key,value) pairs vs. brute-force
-oracle), `tests/dc_backrefs.rs` (backrefs, 1.95M nodes / 2.3M node→way edges vs.
-oracle), and `tests/dc_bbox.rs` (the bbox merge-join, validated against an
-independent point-in-box scan). Run with the sibling `osmflat-rs` checkout
-present, or point `OSMFLAT_DC_ARCHIVE` at an archive.
+All three are checked end-to-end by synthetic, in-memory tests behind
+`test-support`:
+
+```sh
+cargo test -p osmflat-extc --features test-support
+```
+
+The tests build a parent `Osm` archive through `osmflat/test-support`, build the
+extension archive in memory, and validate taginfo, backrefs, and bbox
+merge-join results against brute-force oracles.
 
 Still stubbed (`todo!()`): non-bbox spatial (`osmflat-ext/src/spatial.rs`) and
 taginfo `--combinations`. Both sidecar builds are the in-RAM form; planet-scale

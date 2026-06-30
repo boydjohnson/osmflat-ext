@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 
 pub mod build_backrefs;
 pub mod build_taginfo;
+#[cfg(feature = "test-support")]
+pub mod test_support;
 
 /// What to build and where to spill.
 #[derive(Debug, Clone, Default)]
@@ -57,10 +59,18 @@ impl std::error::Error for BuildError {}
 /// write the `Ext` archive to `out_dir`.
 pub fn build(parent_dir: &Path, out_dir: &Path, opts: &BuildOptions) -> Result<(), BuildError> {
     let parent = osmflat::Osm::open(osmflat::FileResourceStorage::new(parent_dir.to_path_buf()))?;
-
     let storage = osmflat::FileResourceStorage::new(out_dir.to_path_buf());
-    let builder = osmflat_ext::ExtBuilder::new(storage)?;
+    build_into(&parent, storage, opts)
+}
 
+/// Build the requested sidecars for an already-open parent archive into
+/// `storage`.
+pub fn build_into(
+    parent: &osmflat::Osm,
+    storage: flatdata::StorageHandle,
+    opts: &BuildOptions,
+) -> Result<(), BuildError> {
+    let builder = osmflat_ext::ExtBuilder::new(storage)?;
     // This archive's own stringtable: index 0 is the empty string, the tool
     // version follows. `builder_idx` points at the version.
     let mut stringtable = vec![0u8];
@@ -69,16 +79,16 @@ pub fn build(parent_dir: &Path, out_dir: &Path, opts: &BuildOptions) -> Result<(
     stringtable.push(0);
     builder.set_stringtable(&stringtable)?;
 
-    let header = osmflat_ext::fingerprint::build_header(&parent, builder_idx);
+    let header = osmflat_ext::fingerprint::build_header(parent, builder_idx);
     builder.set_header(&header)?;
 
     if opts.taginfo {
         let taginfo = builder.taginfo()?;
-        build_taginfo::build(&parent, &taginfo, opts)?;
+        build_taginfo::build(parent, &taginfo, opts)?;
     }
     if opts.backrefs {
         let backrefs = builder.backrefs()?;
-        build_backrefs::build(&parent, &backrefs)?;
+        build_backrefs::build(parent, &backrefs)?;
     }
     Ok(())
 }
