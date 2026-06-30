@@ -217,6 +217,11 @@ fn taginfo_matches_brute_force_oracle() {
             assert_eq!(counts.nodes, nodes.len() as u64);
             assert_eq!(counts.ways, ways.len() as u64);
             assert_eq!(counts.relations, rels.len() as u64);
+            assert_eq!(
+                value_view.combinations().count(),
+                0,
+                "tag combinations should be empty without --combinations"
+            );
 
             count_nodes += counts.nodes;
             count_ways += counts.ways;
@@ -254,24 +259,41 @@ fn taginfo_matches_brute_force_oracle() {
 #[derive(Default)]
 struct CombinationOracle {
     by_key: HashMap<Key, Vec<(Key, u64)>>,
+    by_tag: HashMap<(Key, Value), Vec<(Key, Value, u64)>>,
 }
 
 impl CombinationOracle {
     fn build(parent: &Osm) -> Self {
-        let mut counts: HashMap<(Key, Key), u64> = HashMap::new();
+        let mut key_counts: HashMap<(Key, Key), u64> = HashMap::new();
+        let mut tag_counts: HashMap<((Key, Value), (Key, Value)), u64> = HashMap::new();
 
-        for keys in entity_keys(parent) {
+        for tags in entity_tags(parent) {
+            let mut keys: Vec<Key> = tags.iter().map(|(key, _)| key.clone()).collect();
+            keys.sort();
+            keys.dedup();
             for key in &keys {
                 for other_key in &keys {
                     if key != other_key {
-                        *counts.entry((key.clone(), other_key.clone())).or_default() += 1;
+                        *key_counts
+                            .entry((key.clone(), other_key.clone()))
+                            .or_default() += 1;
+                    }
+                }
+            }
+
+            for tag in &tags {
+                for other_tag in &tags {
+                    if tag != other_tag {
+                        *tag_counts
+                            .entry((tag.clone(), other_tag.clone()))
+                            .or_default() += 1;
                     }
                 }
             }
         }
 
         let mut by_key: HashMap<Key, Vec<(Key, u64)>> = HashMap::new();
-        for ((key, other_key), together_count) in counts {
+        for ((key, other_key), together_count) in key_counts {
             by_key
                 .entry(key)
                 .or_default()
@@ -281,11 +303,26 @@ impl CombinationOracle {
             combos.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
         }
 
-        CombinationOracle { by_key }
+        let mut by_tag: HashMap<(Key, Value), Vec<(Key, Value, u64)>> = HashMap::new();
+        for ((tag, other_tag), together_count) in tag_counts {
+            by_tag
+                .entry(tag)
+                .or_default()
+                .push((other_tag.0, other_tag.1, together_count));
+        }
+        for combos in by_tag.values_mut() {
+            combos.sort_by(|a, b| {
+                b.2.cmp(&a.2)
+                    .then_with(|| a.0.cmp(&b.0))
+                    .then_with(|| a.1.cmp(&b.1))
+            });
+        }
+
+        CombinationOracle { by_key, by_tag }
     }
 }
 
-fn entity_keys(parent: &Osm) -> Vec<Vec<Key>> {
+fn entity_tags(parent: &Osm) -> Vec<Vec<(Key, Value)>> {
     let tags = parent.tags();
     let tags_index = parent.tags_index();
     let strings = parent.stringtable();
@@ -298,15 +335,18 @@ fn entity_keys(parent: &Osm) -> Vec<Vec<Key>> {
         .chain(parent.ways().iter().map(|way| way.tags()))
         .chain(parent.relations().iter().map(|relation| relation.tags()))
     {
-        let mut keys: Vec<Key> = range
+        let mut entity_tags: Vec<(Key, Value)> = range
             .map(|tag_index_idx| {
                 let tag = &tags[tags_index[tag_index_idx as usize].value() as usize];
-                strings.substring_raw(tag.key_idx() as usize).to_vec()
+                (
+                    strings.substring_raw(tag.key_idx() as usize).to_vec(),
+                    strings.substring_raw(tag.value_idx() as usize).to_vec(),
+                )
             })
             .collect();
-        keys.sort();
-        keys.dedup();
-        out.push(keys);
+        entity_tags.sort();
+        entity_tags.dedup();
+        out.push(entity_tags);
     }
 
     out
@@ -329,6 +369,26 @@ fn combinations_match_brute_force_oracle() {
             .collect();
         let want = oracle.by_key.get(&key).cloned().unwrap_or_default();
         assert_eq!(got, want, "combinations for key {key:?}");
+
+        for value_view in key_view.values() {
+            let value = value_view.value().to_vec();
+            let got: Vec<(Key, Value, u64)> = value_view
+                .combinations()
+                .map(|combo| {
+                    (
+                        combo.key().to_vec(),
+                        combo.value().to_vec(),
+                        combo.together_count(),
+                    )
+                })
+                .collect();
+            let want = oracle
+                .by_tag
+                .get(&(key.clone(), value.clone()))
+                .cloned()
+                .unwrap_or_default();
+            assert_eq!(got, want, "combinations for tag {key:?}={value:?}");
+        }
     }
 
     let amenity = taginfo.key(b"amenity").expect("amenity key exists");
@@ -341,6 +401,28 @@ fn combinations_match_brute_force_oracle() {
             .iter()
             .any(|(key, count)| key.as_slice() == b"name" && *count == 3),
         "amenity should co-occur with name on three entities"
+    );
+
+    let amenity_cafe = taginfo
+        .kv(b"amenity", b"cafe")
+        .expect("amenity=cafe exists");
+    let tag_combos: Vec<(Key, Value, u64)> = amenity_cafe
+        .combinations()
+        .map(|combo| {
+            (
+                combo.key().to_vec(),
+                combo.value().to_vec(),
+                combo.together_count(),
+            )
+        })
+        .collect();
+    assert!(
+        tag_combos
+            .iter()
+            .any(|(key, value, count)| key.as_slice() == b"name"
+                && value.as_slice() == b"Alpha"
+                && *count == 1),
+        "amenity=cafe should co-occur with name=Alpha on one entity"
     );
 }
 

@@ -42,6 +42,7 @@ cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway
 cargo run --example taginfo  -- district-of-columbia.osmflat dc-combos.ext highway --combinations
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway crossing
+cargo run --example taginfo  -- district-of-columbia.osmflat dc-combos.ext highway crossing --combinations
 
 # reverse references (OSM-id lookup needs the parent built with --reverse-ids)
 cargo run --example backrefs -- district-of-columbia.osmflat dc.ext node 281072
@@ -70,7 +71,8 @@ implemented and tested.**
   node radius, nearest-neighbor, and polygon queries with `f64` lon/lat
   arguments and no extension sidecar.
 - `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
-  keys, exposed through `KeyView::combinations`.
+  keys (`KeyView::combinations`) and per-tag co-occurring `key=value` pairs
+  (`ValueView::combinations`).
 - The fingerprint guard is wired into `ExtArchive::open`.
 
 All three are checked end-to-end by synthetic, in-memory tests behind
@@ -87,7 +89,7 @@ merge-join results against brute-force oracles.
 Still incomplete: both sidecar builds are the in-RAM form; planet-scale mmap
 scratch is not yet wired up.
 
-The parent is a path dependency on `../osmflat-rs/osmflat` (the
-`feature/spatial-index` + `Ids` branch this is designed against).
+The parent `osmflat` crate is resolved from the `feature/spatial-index` branch
+of <https://github.com/boydjohnson/osmflat-rs>.
 
 [osmflat]: https://docs.rs/osmflat

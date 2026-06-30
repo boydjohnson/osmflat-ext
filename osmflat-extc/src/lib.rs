@@ -20,7 +20,7 @@ pub struct BuildOptions {
     pub taginfo: bool,
     /// Build the Backrefs sub-archive.
     pub backrefs: bool,
-    /// Also build taginfo key co-occurrence (phase 2).
+    /// Also build taginfo key and tag co-occurrence.
     pub combinations: bool,
     /// Directory for mmap-backed postings scratch (planet scale).
     pub mmap_scratch: Option<PathBuf>,

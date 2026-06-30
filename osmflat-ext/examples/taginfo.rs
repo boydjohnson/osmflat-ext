@@ -19,6 +19,7 @@
 //!
 //! # one key=value: counts by type and a few example OSM ids
 //! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway primary
+//! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway primary --combinations
 //! ```
 //!
 //! LICENSE: the code in this example file is released into the Public Domain.
@@ -40,7 +41,7 @@ struct Args {
     key: Option<String>,
     /// Optional value (with `key`) to inspect a single `key=value`.
     value: Option<String>,
-    /// With a key, print co-occurring keys instead of values.
+    /// With a key, print co-occurring keys; with key=value, print co-occurring tags.
     ///
     /// Requires building the sidecar with `osmflat-extc --combinations`.
     #[arg(long)]
@@ -75,10 +76,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     ) {
         (None, _, _) => list_keys(&tq, args.top),
         (Some(key), None, false) => show_key(&tq, key, args.top),
-        (Some(key), None, true) => show_combinations(&tq, key, args.top),
-        (Some(_), Some(_), true) => {
-            Err("--combinations can only be used with a key, not key=value".into())
-        }
+        (Some(key), None, true) => show_key_combinations(&tq, key, args.top),
+        (Some(key), Some(value), true) => show_tag_combinations(&tq, key, value, args.top),
         (Some(key), Some(value), false) => show_kv(archive.parent(), &tq, key, value, args.top),
     }
 }
@@ -147,7 +146,7 @@ fn show_key(tq: &TaginfoQuery, key: &str, top: usize) -> Result<(), Box<dyn std:
 }
 
 /// Taginfo "combinations": other keys used by objects that carry this key.
-fn show_combinations(
+fn show_key_combinations(
     tq: &TaginfoQuery,
     key: &str,
     top: usize,
@@ -171,6 +170,45 @@ fn show_combinations(
     println!("{:<28} {:>12}", "other key", "together");
     for (other_key, together_count) in combos.into_iter().take(top) {
         println!("{:<28} {:>12}", s(&other_key), together_count);
+    }
+
+    Ok(())
+}
+
+/// Taginfo "combinations" for one `key=value`: other tags used by matching objects.
+fn show_tag_combinations(
+    tq: &TaginfoQuery,
+    key: &str,
+    value: &str,
+    top: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let tag = tq
+        .kv(key.as_bytes(), value.as_bytes())
+        .ok_or_else(|| format!("{key}={value} not found"))?;
+    let combos: Vec<_> = tag
+        .combinations()
+        .map(|c| (c.key().to_vec(), c.value().to_vec(), c.together_count()))
+        .collect();
+
+    if combos.is_empty() {
+        println!(
+            "{key}={value}: no combinations stored (rebuild the sidecar with osmflat-extc --combinations)"
+        );
+        return Ok(());
+    }
+
+    println!("{key}={value}: top co-occurring tags\n");
+    println!(
+        "{:<28} {:<28} {:>12}",
+        "other key", "other value", "together"
+    );
+    for (other_key, other_value, together_count) in combos.into_iter().take(top) {
+        println!(
+            "{:<28} {:<28} {:>12}",
+            s(&other_key),
+            s(&other_value),
+            together_count
+        );
     }
 
     Ok(())
