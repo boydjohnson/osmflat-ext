@@ -45,22 +45,37 @@ impl<'a> TaginfoQuery<'a> {
 
     /// Locate a key by exact string via binary search over `keys`.
     /// `O(log K)` plus the comparisons' string reads.
-    pub fn key(&self, _key: &[u8]) -> Option<KeyView<'a>> {
-        todo!("binary_search_by over taginfo.keys(), comparing self.string(key_idx) to `key`")
+    pub fn key(&self, key: &[u8]) -> Option<KeyView<'a>> {
+        let keys = self.taginfo.keys();
+        let idx = keys
+            .binary_search_by(|k| self.string(k.key_idx()).cmp(key))
+            .ok()?;
+        Some(KeyView { q: *self, idx })
     }
 
     /// Keys sharing a string prefix, in sorted order — the taginfo search box.
     /// Binary-search the lower bound, then scan while the prefix holds.
-    pub fn keys_with_prefix(&self, _prefix: &[u8]) -> impl Iterator<Item = KeyView<'a>> {
-        todo!("partition_point for the prefix lower bound, then take_while prefix matches");
-        #[allow(unreachable_code)]
-        std::iter::empty()
+    pub fn keys_with_prefix(&self, prefix: &[u8]) -> impl Iterator<Item = KeyView<'a>> {
+        let keys = self.taginfo.keys();
+        let lo = keys.partition_point(|k| self.string(k.key_idx()) < prefix);
+        let q = *self;
+        // Collect the contiguous prefix run; `keys` is sorted, so it ends as
+        // soon as the prefix no longer matches.
+        let mut out = Vec::new();
+        for idx in lo..keys.len() {
+            if q.string(keys[idx].key_idx()).starts_with(prefix) {
+                out.push(KeyView { q, idx });
+            } else {
+                break;
+            }
+        }
+        out.into_iter()
     }
 
-    /// All distinct keys, in sorted order (taginfo "keys" table).
+    /// All distinct keys, in sorted order (taginfo "keys" table). The flatdata
+    /// sentinel is already trimmed from `keys()`, so the whole slice is real.
     pub fn keys(&self) -> impl Iterator<Item = KeyView<'a>> + '_ {
-        // Excludes the trailing sentinel key.
-        let n = self.taginfo.keys().len().saturating_sub(1);
+        let n = self.taginfo.keys().len();
         (0..n).map(move |i| KeyView { q: *self, idx: i })
     }
 
@@ -116,8 +131,17 @@ impl<'a> KeyView<'a> {
 
     /// Find one value of this key by exact string (binary search within the
     /// key's value range).
-    pub fn value(&self, _value: &[u8]) -> Option<ValueView<'a>> {
-        todo!("binary_search within entry().values() range, comparing self.q.string(value_idx)")
+    pub fn value(&self, value: &[u8]) -> Option<ValueView<'a>> {
+        let r = self.entry().values();
+        let q = self.q;
+        let slice = &q.taginfo.values()[r.start as usize..r.end as usize];
+        let off = slice
+            .binary_search_by(|v| q.string(v.value_idx()).cmp(value))
+            .ok()?;
+        Some(ValueView {
+            q,
+            idx: r.start as usize + off,
+        })
     }
 }
 

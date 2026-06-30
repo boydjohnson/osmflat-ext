@@ -55,17 +55,30 @@ impl std::error::Error for BuildError {}
 
 /// Open the parent archive at `parent_dir`, build the requested sidecars, and
 /// write the `Ext` archive to `out_dir`.
-///
-/// Steps:
-/// 1. open parent (`osmflat::Osm::open`) and create the `ExtBuilder`;
-/// 2. write the [`ExtHeader`](osmflat_ext::ExtHeader) fingerprint
-///    ([`osmflat_ext::fingerprint::build_header`]) + this tool's version into
-///    the sidecar's stringtable;
-/// 3. if `opts.taginfo`, run [`build_taginfo::build`];
-/// 4. if `opts.backrefs`, run [`build_backrefs::build`].
-pub fn build(_parent_dir: &Path, _out_dir: &Path, _opts: &BuildOptions) -> Result<(), BuildError> {
-    todo!(
-        "open parent + create ExtBuilder; write fingerprint header; \
-         dispatch to build_taginfo / build_backrefs"
-    )
+pub fn build(parent_dir: &Path, out_dir: &Path, opts: &BuildOptions) -> Result<(), BuildError> {
+    let parent = osmflat::Osm::open(osmflat::FileResourceStorage::new(parent_dir.to_path_buf()))?;
+
+    let storage = osmflat::FileResourceStorage::new(out_dir.to_path_buf());
+    let builder = osmflat_ext::ExtBuilder::new(storage)?;
+
+    // This archive's own stringtable: index 0 is the empty string, the tool
+    // version follows. `builder_idx` points at the version.
+    let mut stringtable = vec![0u8];
+    let builder_idx = stringtable.len() as u64;
+    stringtable.extend_from_slice(concat!("osmflat-extc ", env!("CARGO_PKG_VERSION")).as_bytes());
+    stringtable.push(0);
+    builder.set_stringtable(&stringtable)?;
+
+    let header = osmflat_ext::fingerprint::build_header(&parent, builder_idx);
+    builder.set_header(&header)?;
+
+    if opts.taginfo {
+        let taginfo = builder.taginfo()?;
+        build_taginfo::build(&parent, &taginfo, opts)?;
+    }
+    if opts.backrefs {
+        let backrefs = builder.backrefs()?;
+        build_backrefs::build(&parent, &backrefs)?;
+    }
+    Ok(())
 }

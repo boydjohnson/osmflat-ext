@@ -17,28 +17,50 @@ use std::ops::Range;
 ///
 /// `O(R·log k)`: binary-search each range's bounds within `postings`.
 pub fn intersect_bbox<'a>(
-    _postings: &'a [Ref],
-    _ranges: &'a [Range<u64>],
+    postings: &'a [Ref],
+    ranges: &'a [Range<u64>],
 ) -> impl Iterator<Item = u64> + 'a {
-    todo!("for each range, partition_point the postings bounds, emit the in-range slice");
-    #[allow(unreachable_code)]
-    std::iter::empty()
+    ranges.iter().flat_map(move |r| {
+        let lo = postings.partition_point(|p| p.value() < r.start);
+        let hi = postings.partition_point(|p| p.value() < r.end);
+        postings[lo..hi].iter().map(|p| p.value())
+    })
 }
 
 /// Intersect two ascending postings slices (e.g. `k1=v1 ∩ k2=v2`).
 /// Linear merge, `O(k1 + k2)`.
-pub fn intersect<'a>(_a: &'a [Ref], _b: &'a [Ref]) -> impl Iterator<Item = u64> + 'a {
-    todo!("two-cursor merge over ascending Ref slices, emit equal values");
-    #[allow(unreachable_code)]
-    std::iter::empty()
+pub fn intersect<'a>(a: &'a [Ref], b: &'a [Ref]) -> impl Iterator<Item = u64> + 'a {
+    let (mut i, mut j) = (0usize, 0usize);
+    std::iter::from_fn(move || {
+        while i < a.len() && j < b.len() {
+            let (av, bv) = (a[i].value(), b[j].value());
+            if av == bv {
+                i += 1;
+                j += 1;
+                return Some(av);
+            } else if av < bv {
+                i += 1;
+            } else {
+                j += 1;
+            }
+        }
+        None
+    })
 }
 
 /// Union of several ascending postings slices (e.g. `key=*` over a key's value
-/// postings). k-way merge with dedup.
-pub fn union<'a>(_lists: &'a [&'a [Ref]]) -> impl Iterator<Item = u64> + 'a {
-    todo!("k-way merge (loser tree / BinaryHeap) over ascending slices, dedup equal");
-    #[allow(unreachable_code)]
-    std::iter::empty()
+/// postings), ascending and deduplicated.
+///
+/// Phase 1 collects-sorts-dedups for correctness; the streaming upgrade is a
+/// loser-tree / `BinaryHeap` k-way merge (design §4, `key=*`).
+pub fn union(lists: &[&[Ref]]) -> impl Iterator<Item = u64> {
+    let mut out: Vec<u64> = lists
+        .iter()
+        .flat_map(|l| l.iter().map(|p| p.value()))
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out.into_iter()
 }
 
 /// A composable selection of entities of one type: a chain of tag postings to
@@ -74,9 +96,42 @@ impl<'a> Selection<'a> {
 
     /// Resolve to the matching parent indices, ascending.
     pub fn resolve(self) -> Vec<u64> {
-        todo!(
-            "intersect terms smallest-first, then clip by bbox_ranges; \
-             both via the merge helpers above"
-        )
+        // Intersect smallest term first to keep intermediates small.
+        let mut terms = self.terms;
+        terms.sort_by_key(|t| t.len());
+        let mut acc: Vec<u64> = match terms.first() {
+            Some(first) => first.iter().map(|p| p.value()).collect(),
+            None => return Vec::new(),
+        };
+        for term in &terms[1..] {
+            acc = intersect_sorted(&acc, term.iter().map(|p| p.value()));
+        }
+        if let Some(ranges) = self.bbox_ranges {
+            acc = ranges
+                .iter()
+                .flat_map(|r| {
+                    let lo = acc.partition_point(|&v| v < r.start);
+                    let hi = acc.partition_point(|&v| v < r.end);
+                    acc[lo..hi].iter().copied()
+                })
+                .collect();
+        }
+        acc
     }
+}
+
+/// Intersect an ascending `acc` with an ascending iterator `b`.
+fn intersect_sorted(acc: &[u64], b: impl Iterator<Item = u64>) -> Vec<u64> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    for bv in b {
+        while i < acc.len() && acc[i] < bv {
+            i += 1;
+        }
+        if i < acc.len() && acc[i] == bv {
+            out.push(bv);
+            i += 1;
+        }
+    }
+    out
 }

@@ -53,8 +53,9 @@ impl ExtArchive {
     /// Open a parent `Osm` archive and its sibling `Ext` archive, verifying the
     /// fingerprint. Returns [`fingerprint::Mismatch`] if the sidecar was built
     /// against a different parent.
-    pub fn open(_parent: osmflat::Osm, _ext: Ext) -> Result<Self, fingerprint::Mismatch> {
-        todo!("verify fingerprint (fingerprint::verify) then store both")
+    pub fn open(parent: osmflat::Osm, ext: Ext) -> Result<Self, fingerprint::Mismatch> {
+        fingerprint::verify(&parent, &ext)?;
+        Ok(Self { parent, ext })
     }
 
     /// The underlying parent archive.

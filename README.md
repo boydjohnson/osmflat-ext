@@ -30,11 +30,19 @@ osmflat-extc/        bin+lib: the compiler that builds sidecars
 
 ## Status
 
-Compiling skeleton. The schema, generated bindings, crate split, and full
-query/compiler API surface are in place; the bodies are `todo!()` stubs keyed to
-the design doc's phases. Build from phase 1 (Taginfo): the dictionary +
-count + fill passes in `osmflat-extc/src/build_taginfo.rs`, then the binary
-search / merge-join bodies in `osmflat-ext/src/taginfo.rs` and `query.rs`.
+**Phase 1 (Taginfo) is implemented and tested.** The compiler builds the
+inverted tag index + histograms (`osmflat-extc --taginfo`), the query side does
+key/value binary search + postings + the bbox merge-join, and the fingerprint
+guard is wired into `ExtArchive::open`. An end-to-end test
+(`osmflat-extc/tests/dc.rs`) builds the sidecar for the district-of-columbia
+archive and checks every key, value, and postings list against a brute-force
+oracle (2,123 keys / 200k (key,value) pairs). Run it with the sibling
+`osmflat-rs` checkout present, or point `OSMFLAT_DC_ARCHIVE` at an archive.
+
+Still stubbed (`todo!()`): the `Backrefs` build (`osmflat-extc/src/build_backrefs.rs`)
+and reader (`osmflat-ext/src/backrefs.rs`), non-bbox spatial
+(`osmflat-ext/src/spatial.rs`), and taginfo `--combinations`. The Taginfo build
+is the in-RAM form; planet-scale mmap scratch is not yet wired up.
 
 The parent is a path dependency on `../osmflat-rs/osmflat` (the
 `feature/spatial-index` + `Ids` branch this is designed against).

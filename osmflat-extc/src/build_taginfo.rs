@@ -1,47 +1,202 @@
 //! Build the `Taginfo` sub-archive: inverted tag index + histograms.
 //!
-//! Three phases (`osmflat-ext-design.md` §6.2), all over the mmapped parent:
+//! The parent's `tags` vector is already deduplicated — each distinct
+//! `(key,value)` is exactly one `Tag`, at index `t` — so a tag *slot* is just
+//! that `t`. Postings are collected per slot by iterating entities **in index
+//! order**, which makes each postings run ascending == spatial (SFC) order with
+//! no sort (design §3, §6.2).
 //!
-//! * **Phase 0 — dictionary.** Scan `tags_index → tags → (key_idx, value_idx)`
-//!   to collect the distinct `(key,value)` set and group values under keys.
-//!   Sort keys by *string* (resolved against the parent stringtable); within a
-//!   key, sort values by string. This fixes each `(k,v)`'s dense slot and emits
-//!   the `keys` / `values` vectors (counts filled in phase 2).
-//! * **Phase 1 — count.** Per type, iterate entities in index order; for each
-//!   tag occurrence bump a per-(slot,type) counter. Prefix-sum into the postings
-//!   offsets (`@range` first_idx fields + sentinel).
-//! * **Phase 2 — fill.** Iterate entities in index order again; append each
-//!   entity index into its `(k,v)` postings slot. In-order iteration makes each
-//!   postings run ascending == spatial order, no sort. Accumulate `KeyEntry`
-//!   per-type counts here.
+//! Then the dictionary is built: group slots by key, sort keys by string and,
+//! within a key, values by string; emit `keys` / `values` and lay the postings
+//! down grouped by `(key,value)` in that sorted order.
 //!
-//! At planet scale, postings spill to mmap scratch; the `(key,value) → slot`
-//! map stays resident (a few hundred MB), or is replaced by an external
-//! emit→sort→reduce of `(slot, type, entity)` tuples — see design §6.2.
+//! This is the in-RAM form (correct, fine for regional extents). The planet
+//! path spills postings to mmap scratch; not wired up here.
 
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
 use osmflat_ext::TaginfoBuilder;
 
+/// Per-type postings for one tag slot, ascending entity indices.
+#[derive(Default)]
+struct SlotPostings {
+    nodes: Vec<u64>,
+    ways: Vec<u64>,
+    relations: Vec<u64>,
+}
+
 /// Build and write the `Taginfo` sub-archive for `parent` into `builder`.
 pub fn build(
-    _parent: &Osm,
-    _builder: &TaginfoBuilder,
+    parent: &Osm,
+    builder: &TaginfoBuilder,
     _opts: &BuildOptions,
 ) -> Result<(), BuildError> {
-    // Phase 0
-    let _dict = build_dictionary(_parent)?;
-    // Phases 1-2
-    todo!("count postings, prefix-sum offsets, fill postings; write keys/values/*_post")
+    let n_tags = parent.tags().len();
+    let mut postings: Vec<SlotPostings> = (0..n_tags).map(|_| SlotPostings::default()).collect();
+
+    // Phase 1+2 fused: collect postings per slot, in entity order (ascending).
+    collect(parent, |t, entity, ty| match ty {
+        EntityType::Node => postings[t].nodes.push(entity),
+        EntityType::Way => postings[t].ways.push(entity),
+        EntityType::Relation => postings[t].relations.push(entity),
+    });
+
+    // Phase 0 (after counting): group slots by key, sort keys/values by string.
+    let dict = Dictionary::build(parent);
+
+    write(parent, builder, &dict, &postings)
 }
 
-/// The sorted key/value dictionary and the `(key_idx, value_idx) -> slot` map.
-pub struct Dictionary {
-    // keys sorted by string; values grouped by key, sorted by string;
-    // slot id per distinct (k,v); resident map for phases 1-2.
+#[derive(Clone, Copy)]
+enum EntityType {
+    Node,
+    Way,
+    Relation,
 }
 
-/// Phase 0: collect distinct tags, group by key, sort keys and values by string.
-fn build_dictionary(_parent: &Osm) -> Result<Dictionary, BuildError> {
-    todo!("scan tags_index/tags; group values under keys; sort by parent stringtable strings")
+/// Visit every `(slot, entity_index, type)` occurrence, entities in index order
+/// so postings come out ascending.
+fn collect(parent: &Osm, mut visit: impl FnMut(usize, u64, EntityType)) {
+    let tags_index = parent.tags_index();
+    let slot = |ti: u64| tags_index[ti as usize].value() as usize;
+    for (i, node) in parent.nodes().iter().enumerate() {
+        for ti in node.tags() {
+            visit(slot(ti), i as u64, EntityType::Node);
+        }
+    }
+    for (i, way) in parent.ways().iter().enumerate() {
+        for ti in way.tags() {
+            visit(slot(ti), i as u64, EntityType::Way);
+        }
+    }
+    for (i, relation) in parent.relations().iter().enumerate() {
+        for ti in relation.tags() {
+            visit(slot(ti), i as u64, EntityType::Relation);
+        }
+    }
+}
+
+/// Keys sorted by string; within each key, the tag slots sorted by value string.
+struct Dictionary {
+    /// One entry per distinct key: its `key_idx` and its slots (value-sorted).
+    keys: Vec<KeyGroup>,
+}
+
+struct KeyGroup {
+    key_idx: u64,
+    /// Tag slots (`t`) for this key, sorted by value string.
+    slots: Vec<u64>,
+}
+
+impl Dictionary {
+    fn build(parent: &Osm) -> Self {
+        use std::collections::HashMap;
+        let tags = parent.tags();
+        let strings = parent.stringtable();
+
+        // Group tag slots by key_idx.
+        let mut by_key: HashMap<u64, Vec<u64>> = HashMap::new();
+        for (t, tag) in tags.iter().enumerate() {
+            by_key.entry(tag.key_idx()).or_default().push(t as u64);
+        }
+
+        let mut keys: Vec<KeyGroup> = by_key
+            .into_iter()
+            .map(|(key_idx, mut slots)| {
+                // Sort this key's slots by value string.
+                slots.sort_by(|&a, &b| {
+                    strings
+                        .substring_raw(tags[a as usize].value_idx() as usize)
+                        .cmp(strings.substring_raw(tags[b as usize].value_idx() as usize))
+                });
+                KeyGroup { key_idx, slots }
+            })
+            .collect();
+
+        // Sort keys by key string.
+        keys.sort_by(|a, b| {
+            strings
+                .substring_raw(a.key_idx as usize)
+                .cmp(strings.substring_raw(b.key_idx as usize))
+        });
+
+        Dictionary { keys }
+    }
+}
+
+/// Emit `keys` / `values` / `*_post` in dictionary order, closing each range
+/// with a trailing sentinel.
+fn write(
+    parent: &Osm,
+    builder: &TaginfoBuilder,
+    dict: &Dictionary,
+    postings: &[SlotPostings],
+) -> Result<(), BuildError> {
+    let tags = parent.tags();
+
+    let mut keys_vec = builder.start_keys()?;
+    let mut values_vec = builder.start_values()?;
+    let mut node_post = builder.start_node_post()?;
+    let mut way_post = builder.start_way_post()?;
+    let mut rel_post = builder.start_rel_post()?;
+
+    let (mut values_written, mut nodes_written, mut ways_written, mut rels_written) =
+        (0u64, 0u64, 0u64, 0u64);
+
+    for group in &dict.keys {
+        // Per-key aggregate counts (sum of value postings; keys unique per object).
+        let (mut cn, mut cw, mut cr) = (0u64, 0u64, 0u64);
+        for &t in &group.slots {
+            let p = &postings[t as usize];
+            cn += p.nodes.len() as u64;
+            cw += p.ways.len() as u64;
+            cr += p.relations.len() as u64;
+        }
+
+        let key = keys_vec.grow()?;
+        key.set_key_idx(group.key_idx);
+        key.set_count_nodes(cn);
+        key.set_count_ways(cw);
+        key.set_count_relations(cr);
+        key.set_value_first_idx(values_written);
+
+        for &t in &group.slots {
+            let p = &postings[t as usize];
+            let value = values_vec.grow()?;
+            value.set_value_idx(tags[t as usize].value_idx());
+            value.set_node_first_idx(nodes_written);
+            value.set_way_first_idx(ways_written);
+            value.set_rel_first_idx(rels_written);
+
+            for &e in &p.nodes {
+                node_post.grow()?.set_value(e);
+            }
+            for &e in &p.ways {
+                way_post.grow()?.set_value(e);
+            }
+            for &e in &p.relations {
+                rel_post.grow()?.set_value(e);
+            }
+            nodes_written += p.nodes.len() as u64;
+            ways_written += p.ways.len() as u64;
+            rels_written += p.relations.len() as u64;
+            values_written += 1;
+        }
+    }
+
+    // Sentinels close the last real key's value range and the last value's
+    // postings ranges. flatdata trims these from the reader slices.
+    let key_sentinel = keys_vec.grow()?;
+    key_sentinel.set_value_first_idx(values_written);
+    let value_sentinel = values_vec.grow()?;
+    value_sentinel.set_node_first_idx(nodes_written);
+    value_sentinel.set_way_first_idx(ways_written);
+    value_sentinel.set_rel_first_idx(rels_written);
+
+    keys_vec.close()?;
+    values_vec.close()?;
+    node_post.close()?;
+    way_post.close()?;
+    rel_post.close()?;
+    Ok(())
 }
