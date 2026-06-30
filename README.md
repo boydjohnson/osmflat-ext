@@ -30,8 +30,8 @@ osmflat-extc/        bin+lib: the compiler that builds sidecars
 
 ## Examples
 
-Two runnable examples in `osmflat-ext/examples/` query a built sidecar (point
-them at a parent archive + its `Ext` dir):
+Runnable examples in `osmflat-ext/examples/` query built sidecars or the parent
+archive directly:
 
 ```text
 osmflat-extc --taginfo --backrefs --out dc.ext district-of-columbia.osmflat
@@ -46,6 +46,11 @@ cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway cros
 # reverse references (OSM-id lookup needs the parent built with --reverse-ids)
 cargo run --example backrefs -- district-of-columbia.osmflat dc.ext node 281072
 cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 535462113
+
+# non-bbox spatial node queries (no Ext sidecar needed)
+cargo run --example spatial -- district-of-columbia.osmflat radius -77.0365 38.8977 0.01
+cargo run --example spatial -- district-of-columbia.osmflat nearest -77.0365 38.8977 --k 10
+cargo run --example spatial -- district-of-columbia.osmflat polygon -77.04 38.89 -77.01 38.89 -77.01 38.91 -77.04 38.91
 ```
 
 ## Status
