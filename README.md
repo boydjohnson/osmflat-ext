@@ -70,6 +70,10 @@ cargo run --example spatial -- district-of-columbia.osmflat polygon -77.04 38.89
 - `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
   keys (`KeyView::combinations`) and per-tag co-occurring `key=value` pairs
   (`ValueView::combinations`).
+- `osmflat-extc --mmap-scratch DIR` backs both sidecar builds' postings and
+  offset arrays with unlinked mmap temp files under `DIR` instead of RAM
+  (planet scale); the builds are count-then-fill CSR either way, only the
+  backing storage changes.
 - The fingerprint guard is wired into `ExtArchive::open`.
 
 The sidecar compiler has a `test-support` feature that builds synthetic parent
@@ -90,9 +94,9 @@ cargo build --workspace --examples --all-features
 
 ## Current Limitation
 
-Both sidecar builds currently use the in-RAM builder path. The
-`--mmap-scratch` option is reserved for a planet-scale postings build path but
-is not wired up yet.
+The `--combinations` co-occurrence maps are built with in-RAM hash maps even
+under `--mmap-scratch`; at planet scale prefer building combinations on a
+machine with RAM to match, or skip the flag.
 
 The parent `osmflat` crate is resolved from the `feature/spatial-index` branch
 of <https://github.com/boydjohnson/osmflat-rs>.

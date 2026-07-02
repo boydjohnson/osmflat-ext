@@ -104,6 +104,18 @@ fn archive(opts: osmflat_extc::BuildOptions) -> ExtArchive {
     build_ext_archive(parent, &opts).expect("build synthetic extension archive")
 }
 
+/// `opts` with the scratch arrays spilled to mmap temp files in `dir`, to run
+/// an oracle check against the mmap-backed build path.
+fn with_mmap_scratch(
+    opts: osmflat_extc::BuildOptions,
+    dir: &tempfile::TempDir,
+) -> osmflat_extc::BuildOptions {
+    osmflat_extc::BuildOptions {
+        mmap_scratch: Some(dir.path().to_path_buf()),
+        ..opts
+    }
+}
+
 #[derive(Default)]
 struct TagOracle {
     kv_nodes: HashMap<(Key, Value), Vec<u64>>,
@@ -165,10 +177,26 @@ fn refs_to_vec(refs: &[Ref]) -> Vec<u64> {
 
 #[test]
 fn taginfo_matches_brute_force_oracle() {
-    let archive = archive(osmflat_extc::BuildOptions {
+    check_taginfo(osmflat_extc::BuildOptions {
         taginfo: true,
         ..Default::default()
     });
+}
+
+#[test]
+fn taginfo_matches_brute_force_oracle_with_mmap_scratch() {
+    let scratch = tempfile::tempdir().expect("create scratch dir");
+    check_taginfo(with_mmap_scratch(
+        osmflat_extc::BuildOptions {
+            taginfo: true,
+            ..Default::default()
+        },
+        &scratch,
+    ));
+}
+
+fn check_taginfo(opts: osmflat_extc::BuildOptions) {
+    let archive = archive(opts);
     let oracle = TagOracle::build(archive.parent());
     let taginfo = archive.taginfo().expect("taginfo sub-archive present");
 
@@ -354,10 +382,26 @@ fn entity_tags(parent: &Osm) -> Vec<Vec<(Key, Value)>> {
 
 #[test]
 fn combinations_match_brute_force_oracle() {
-    let archive = archive(osmflat_extc::BuildOptions {
+    check_combinations(osmflat_extc::BuildOptions {
         combinations: true,
         ..Default::default()
     });
+}
+
+#[test]
+fn combinations_match_brute_force_oracle_with_mmap_scratch() {
+    let scratch = tempfile::tempdir().expect("create scratch dir");
+    check_combinations(with_mmap_scratch(
+        osmflat_extc::BuildOptions {
+            combinations: true,
+            ..Default::default()
+        },
+        &scratch,
+    ));
+}
+
+fn check_combinations(opts: osmflat_extc::BuildOptions) {
+    let archive = archive(opts);
     let oracle = CombinationOracle::build(archive.parent());
     let taginfo = archive.taginfo().expect("taginfo sub-archive present");
 
@@ -496,10 +540,26 @@ fn check_refs(got: Vec<u64>, want: Option<&Vec<u64>>, ctx: &str) {
 
 #[test]
 fn backrefs_match_brute_force_oracle() {
-    let archive = archive(osmflat_extc::BuildOptions {
+    check_backrefs(osmflat_extc::BuildOptions {
         backrefs: true,
         ..Default::default()
     });
+}
+
+#[test]
+fn backrefs_match_brute_force_oracle_with_mmap_scratch() {
+    let scratch = tempfile::tempdir().expect("create scratch dir");
+    check_backrefs(with_mmap_scratch(
+        osmflat_extc::BuildOptions {
+            backrefs: true,
+            ..Default::default()
+        },
+        &scratch,
+    ));
+}
+
+fn check_backrefs(opts: osmflat_extc::BuildOptions) {
+    let archive = archive(opts);
     let oracle = BackrefsOracle::build(archive.parent());
     let backrefs = archive.backrefs().expect("backrefs sub-archive present");
 

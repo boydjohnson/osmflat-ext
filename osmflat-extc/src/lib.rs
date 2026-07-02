@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 pub mod build_backrefs;
 pub mod build_taginfo;
+mod scratch;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 
@@ -22,7 +23,9 @@ pub struct BuildOptions {
     pub backrefs: bool,
     /// Also build taginfo key and tag co-occurrence.
     pub combinations: bool,
-    /// Directory for mmap-backed postings scratch (planet scale).
+    /// Directory for mmap-backed postings/offset scratch (planet scale).
+    /// `None` keeps every scratch array in RAM (fine for regional extracts);
+    /// `Some(dir)` spills them to unlinked temp files under `dir`.
     pub mmap_scratch: Option<PathBuf>,
 }
 
@@ -88,7 +91,7 @@ pub fn build_into(
     }
     if opts.backrefs {
         let backrefs = builder.backrefs()?;
-        build_backrefs::build(parent, &backrefs)?;
+        build_backrefs::build(parent, &backrefs, opts)?;
     }
     Ok(())
 }

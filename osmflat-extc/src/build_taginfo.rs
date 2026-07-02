@@ -10,20 +10,33 @@
 //! within a key, values by string; emit `keys` / `values` and lay the postings
 //! down grouped by `(key,value)` in that sorted order.
 //!
-//! This is the in-RAM form (correct, fine for regional extents). The planet
-//! path spills postings to mmap scratch; not wired up here.
+//! The postings are built count-then-fill (design §6.2 phases 1–2): the
+//! dictionary fixes each slot's output position, one pass counts occurrences
+//! into CSR offsets, a second pass fills the postings array in final layout.
+//! Every parent-sized array comes from [`Scratch`], so `--mmap-scratch` backs
+//! the build with temp files at planet scale; without it everything stays in
+//! RAM (fine for regional extents). The `--combinations` co-occurrence maps
+//! are the exception: they stay in RAM either way.
 
+use crate::scratch::{Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
 use osmflat_ext::TaginfoBuilder;
 use std::collections::{HashMap, HashSet};
 
-/// Per-type postings for one tag slot, ascending entity indices.
-#[derive(Default)]
-struct SlotPostings {
-    nodes: Vec<u64>,
-    ways: Vec<u64>,
-    relations: Vec<u64>,
+/// CSR postings for one entity type, slot positions in dictionary order.
+struct TypeCsr {
+    /// Exclusive prefix sums: position `p`'s postings span
+    /// `posts[offsets[p]..offsets[p + 1]]`.
+    offsets: ScratchU64,
+    /// Ascending entity indices, grouped by slot position.
+    posts: ScratchU64,
+}
+
+impl TypeCsr {
+    fn at(&self, p: usize) -> &[u64] {
+        &self.posts[self.offsets[p] as usize..self.offsets[p + 1] as usize]
+    }
 }
 
 /// Build and write the `Taginfo` sub-archive for `parent` into `builder`.
@@ -32,24 +45,75 @@ pub fn build(
     builder: &TaginfoBuilder,
     opts: &BuildOptions,
 ) -> Result<(), BuildError> {
-    let n_tags = parent.tags().len();
-    let mut postings: Vec<SlotPostings> = (0..n_tags).map(|_| SlotPostings::default()).collect();
+    let scratch = Scratch::new(opts.mmap_scratch.as_deref());
 
-    // Phase 1+2 fused: collect postings per slot, in entity order (ascending).
-    collect(parent, |t, entity, ty| match ty {
-        EntityType::Node => postings[t].nodes.push(entity),
-        EntityType::Way => postings[t].ways.push(entity),
-        EntityType::Relation => postings[t].relations.push(entity),
-    });
-
-    // Phase 0 (after counting): group slots by key, sort keys/values by string.
+    // Phase 0: the dictionary fixes the output position of every tag slot.
     let dict = Dictionary::build(parent);
-    let cooccurrences = opts
-        .combinations
-        .then(|| Cooccurrences::build(parent))
-        .unwrap_or_default();
+    let n_slots = parent.tags().len();
+    let mut pos = vec![0u64; n_slots];
+    for (p, &t) in dict.keys.iter().flat_map(|g| &g.slots).enumerate() {
+        pos[t as usize] = p as u64;
+    }
 
-    write(parent, builder, &dict, &postings, &cooccurrences)
+    // Phase 1: count occurrences per (position, type), then prefix-sum into
+    // CSR offsets so postings land grouped in dictionary order.
+    let mut offsets = [
+        scratch.alloc(n_slots + 1)?,
+        scratch.alloc(n_slots + 1)?,
+        scratch.alloc(n_slots + 1)?,
+    ];
+    collect(parent, |t, _entity, ty| {
+        offsets[ty.idx()][pos[t] as usize + 1] += 1;
+    });
+    for offsets in &mut offsets {
+        for i in 1..offsets.len() {
+            offsets[i] += offsets[i - 1];
+        }
+    }
+
+    // Phase 2: fill. Entity-order iteration makes each run ascending (§3).
+    let mut posts = [
+        scratch.alloc(offsets[0][n_slots] as usize)?,
+        scratch.alloc(offsets[1][n_slots] as usize)?,
+        scratch.alloc(offsets[2][n_slots] as usize)?,
+    ];
+    let mut cursors = [
+        scratch.alloc_copy(&offsets[0][..n_slots])?,
+        scratch.alloc_copy(&offsets[1][..n_slots])?,
+        scratch.alloc_copy(&offsets[2][..n_slots])?,
+    ];
+    collect(parent, |t, entity, ty| {
+        let (i, p) = (ty.idx(), pos[t] as usize);
+        posts[i][cursors[i][p] as usize] = entity;
+        cursors[i][p] += 1;
+    });
+    drop(cursors);
+    drop(pos);
+
+    let [node_offsets, way_offsets, rel_offsets] = offsets;
+    let [node_posts, way_posts, rel_posts] = posts;
+    let csr = [
+        TypeCsr {
+            offsets: node_offsets,
+            posts: node_posts,
+        },
+        TypeCsr {
+            offsets: way_offsets,
+            posts: way_posts,
+        },
+        TypeCsr {
+            offsets: rel_offsets,
+            posts: rel_posts,
+        },
+    ];
+
+    let cooccurrences = if opts.combinations {
+        Cooccurrences::build(parent)
+    } else {
+        Cooccurrences::default()
+    };
+
+    write(parent, builder, &dict, &csr, &cooccurrences)
 }
 
 #[derive(Clone, Copy)]
@@ -57,6 +121,16 @@ enum EntityType {
     Node,
     Way,
     Relation,
+}
+
+impl EntityType {
+    fn idx(self) -> usize {
+        match self {
+            EntityType::Node => 0,
+            EntityType::Way => 1,
+            EntityType::Relation => 2,
+        }
+    }
 }
 
 /// Visit every `(slot, entity_index, type)` occurrence, entities in index order
@@ -253,7 +327,7 @@ fn write(
     parent: &Osm,
     builder: &TaginfoBuilder,
     dict: &Dictionary,
-    postings: &[SlotPostings],
+    csr: &[TypeCsr; 3],
     combos: &Cooccurrences,
 ) -> Result<(), BuildError> {
     let tags = parent.tags();
@@ -271,14 +345,17 @@ fn write(
     let mut combos_written = 0u64;
     let mut tag_combos_written = 0u64;
 
+    // Running slot position; the fill laid postings down in dictionary order,
+    // so it advances in lockstep with the iteration below.
+    let mut p = 0usize;
+
     for group in &dict.keys {
         // Per-key aggregate counts (sum of value postings; keys unique per object).
         let (mut cn, mut cw, mut cr) = (0u64, 0u64, 0u64);
-        for &t in &group.slots {
-            let p = &postings[t as usize];
-            cn += p.nodes.len() as u64;
-            cw += p.ways.len() as u64;
-            cr += p.relations.len() as u64;
+        for q in p..p + group.slots.len() {
+            cn += csr[0].at(q).len() as u64;
+            cw += csr[1].at(q).len() as u64;
+            cr += csr[2].at(q).len() as u64;
         }
 
         let key = keys_vec.grow()?;
@@ -290,7 +367,9 @@ fn write(
         key.set_combo_first_idx(combos_written);
 
         for &t in &group.slots {
-            let p = &postings[t as usize];
+            let (nodes, ways, rels) = (csr[0].at(p), csr[1].at(p), csr[2].at(p));
+            p += 1;
+
             let value = values_vec.grow()?;
             value.set_value_idx(tags[t as usize].value_idx());
             value.set_node_first_idx(nodes_written);
@@ -298,18 +377,18 @@ fn write(
             value.set_rel_first_idx(rels_written);
             value.set_tag_combo_first_idx(tag_combos_written);
 
-            for &e in &p.nodes {
+            for &e in nodes {
                 node_post.grow()?.set_value(e);
             }
-            for &e in &p.ways {
+            for &e in ways {
                 way_post.grow()?.set_value(e);
             }
-            for &e in &p.relations {
+            for &e in rels {
                 rel_post.grow()?.set_value(e);
             }
-            nodes_written += p.nodes.len() as u64;
-            ways_written += p.ways.len() as u64;
-            rels_written += p.relations.len() as u64;
+            nodes_written += nodes.len() as u64;
+            ways_written += ways.len() as u64;
+            rels_written += rels.len() as u64;
             values_written += 1;
 
             if let Some(entries) = combos.by_tag.get(&t) {
