@@ -143,16 +143,35 @@ pub fn intersect<'a>(a: &'a [Ref], b: &'a [Ref]) -> impl Iterator<Item = u64> + 
 /// Union of several ascending postings slices (e.g. `key=*` over a key's value
 /// postings), ascending and deduplicated.
 ///
-/// Phase 1 collects-sorts-dedups for correctness; the streaming upgrade is a
-/// loser-tree / `BinaryHeap` k-way merge (design §4, `key=*`).
-pub fn union(lists: &[&[Ref]]) -> impl Iterator<Item = u64> {
-    let mut out: Vec<u64> = lists
-        .iter()
-        .flat_map(|l| l.iter().map(|p| p.value()))
+/// Streaming `BinaryHeap` k-way merge (design §4, `key=*`): `O(N log k)` time
+/// for `N` total postings across `k` lists, `O(k)` memory, and lazy — taking
+/// the first `m` results costs `O(m log k)`, not a full materialize-and-sort.
+pub fn union<'a>(lists: &[&'a [Ref]]) -> impl Iterator<Item = u64> + 'a {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    // One cursor per list; the heap holds each cursor's next value, keyed
+    // `(value, list)` so equal values pop deterministically.
+    let mut cursors: Vec<std::slice::Iter<'a, Ref>> = lists.iter().map(|l| l.iter()).collect();
+    let mut heap: BinaryHeap<Reverse<(u64, usize)>> = cursors
+        .iter_mut()
+        .enumerate()
+        .filter_map(|(k, c)| c.next().map(|p| Reverse((p.value(), k))))
         .collect();
-    out.sort_unstable();
-    out.dedup();
-    out.into_iter()
+
+    let mut last: Option<u64> = None;
+    std::iter::from_fn(move || {
+        while let Some(Reverse((v, k))) = heap.pop() {
+            if let Some(p) = cursors[k].next() {
+                heap.push(Reverse((p.value(), k)));
+            }
+            if last != Some(v) {
+                last = Some(v);
+                return Some(v);
+            }
+        }
+        None
+    })
 }
 
 /// A composable selection of entities of one type: a chain of tag postings to
@@ -226,4 +245,89 @@ fn intersect_sorted(acc: &[u64], b: impl Iterator<Item = u64>) -> Vec<u64> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn refs(vals: &[u64]) -> Vec<Ref> {
+        vals.iter()
+            .map(|&v| {
+                let mut r = Ref::new();
+                r.set_value(v);
+                r
+            })
+            .collect()
+    }
+
+    /// The collect-sort-dedup oracle `union` replaced.
+    fn union_oracle(lists: &[&[Ref]]) -> Vec<u64> {
+        let mut out: Vec<u64> = lists
+            .iter()
+            .flat_map(|l| l.iter().map(|p| p.value()))
+            .collect();
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
+    #[test]
+    fn union_of_nothing_is_empty() {
+        assert_eq!(union(&[]).count(), 0);
+        let empty = refs(&[]);
+        assert_eq!(union(&[&empty, &empty]).count(), 0);
+    }
+
+    #[test]
+    fn union_single_list_passes_through() {
+        let a = refs(&[2, 5, 9]);
+        assert_eq!(union(&[&a]).collect::<Vec<_>>(), vec![2, 5, 9]);
+    }
+
+    #[test]
+    fn union_merges_ascending_and_dedups() {
+        let a = refs(&[1, 3, 5]);
+        let b = refs(&[2, 3, 6]);
+        let c = refs(&[5, 7]);
+        let empty = refs(&[]);
+        assert_eq!(
+            union(&[&a, &b, &c, &empty]).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5, 6, 7]
+        );
+    }
+
+    #[test]
+    fn union_is_lazy_prefix() {
+        let a = refs(&[1, 4, 8]);
+        let b = refs(&[2, 4, 9]);
+        assert_eq!(union(&[&a, &b]).take(3).collect::<Vec<_>>(), vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn union_matches_sort_dedup_oracle() {
+        // Deterministic pseudo-random ascending lists with heavy overlap.
+        let mut state = 0x9e3779b97f4a7c15u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let lists: Vec<Vec<Ref>> = (0..7)
+            .map(|_| {
+                let len = (next() % 40) as usize;
+                let mut vals: Vec<u64> = (0..len).map(|_| next() % 64).collect();
+                vals.sort_unstable();
+                vals.dedup();
+                refs(&vals)
+            })
+            .collect();
+        let slices: Vec<&[Ref]> = lists.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            union(&slices).collect::<Vec<_>>(),
+            union_oracle(&slices),
+            "streaming union diverged from sort-dedup oracle"
+        );
+    }
 }
