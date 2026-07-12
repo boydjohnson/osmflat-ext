@@ -47,14 +47,20 @@ pub fn build(
     opts: &BuildOptions,
 ) -> Result<(), BuildError> {
     let scratch = Scratch::new(opts.mmap_scratch.as_deref());
+    let mut phase_start = std::time::Instant::now();
 
     // Phase 0: the dictionary fixes the output position of every tag slot.
     let dict = Dictionary::build(parent);
+    eprintln!("[taginfo] dictionary build: {:?}", phase_start.elapsed());
+    phase_start = std::time::Instant::now();
+
     let n_slots = parent.tags().len();
     let mut pos = vec![0u64; n_slots];
     for (p, &t) in dict.keys.iter().flat_map(|g| &g.slots).enumerate() {
         pos[t as usize] = p as u64;
     }
+    eprintln!("[taginfo] pos vector: {:?}", phase_start.elapsed());
+    phase_start = std::time::Instant::now();
 
     // Phase 1: count occurrences per (position, type), then prefix-sum into
     // CSR offsets so postings land grouped in dictionary order.
@@ -66,11 +72,16 @@ pub fn build(
     collect(parent, |t, _entity, ty| {
         offsets[ty.idx()][pos[t] as usize + 1] += 1;
     });
+    eprintln!("[taginfo] phase 1 (count): {:?}", phase_start.elapsed());
+    phase_start = std::time::Instant::now();
+
     for offsets in &mut offsets {
         for i in 1..offsets.len() {
             offsets[i] += offsets[i - 1];
         }
     }
+    eprintln!("[taginfo] prefix sum: {:?}", phase_start.elapsed());
+    phase_start = std::time::Instant::now();
 
     // Phase 2: fill. Entity-order iteration makes each run ascending (§3).
     let mut posts = [
@@ -88,6 +99,7 @@ pub fn build(
         posts[i][cursors[i][p] as usize] = entity;
         cursors[i][p] += 1;
     });
+    eprintln!("[taginfo] phase 2 (fill): {:?}", phase_start.elapsed());
     drop(cursors);
     drop(pos);
 
@@ -108,13 +120,18 @@ pub fn build(
         },
     ];
 
+    phase_start = std::time::Instant::now();
     let cooccurrences = if opts.combinations {
         Cooccurrences::build(parent)
     } else {
         Cooccurrences::default()
     };
+    eprintln!("[taginfo] cooccurrences: {:?}", phase_start.elapsed());
 
-    write(parent, builder, &dict, &csr, &cooccurrences)
+    phase_start = std::time::Instant::now();
+    let result = write(parent, builder, &dict, &csr, &cooccurrences);
+    eprintln!("[taginfo] write: {:?}", phase_start.elapsed());
+    result
 }
 
 #[derive(Clone, Copy)]
@@ -170,12 +187,11 @@ struct KeyGroup {
 
 impl Dictionary {
     fn build(parent: &Osm) -> Self {
-        use std::collections::HashMap;
         let tags = parent.tags();
         let strings = parent.stringtable();
 
         // Group tag slots by key_idx.
-        let mut by_key: HashMap<u64, Vec<u64>> = HashMap::new();
+        let mut by_key: FxHashMap<u64, Vec<u64>> = FxHashMap::default();
         for (t, tag) in tags.iter().enumerate() {
             by_key.entry(tag.key_idx()).or_default().push(t as u64);
         }
@@ -183,22 +199,33 @@ impl Dictionary {
         let mut keys: Vec<KeyGroup> = by_key
             .into_iter()
             .map(|(key_idx, mut slots)| {
-                // Sort this key's slots by value string.
-                slots.sort_by(|&a, &b| {
-                    strings
-                        .substring_raw(tags[a as usize].value_idx() as usize)
-                        .cmp(strings.substring_raw(tags[b as usize].value_idx() as usize))
-                });
+                // Resolve each slot's value string once and sort on the
+                // cached slice — `sort_by` re-ran `substring_raw` on every
+                // comparison, re-fetching the same string O(log n) times.
+                // Tags are deduplicated per (key,value) (module doc), so no
+                // two slots in a key group tie on value string.
+                let mut decorated: Vec<(&[u8], u64)> = slots
+                    .iter()
+                    .map(|&t| {
+                        (
+                            strings.substring_raw(tags[t as usize].value_idx() as usize),
+                            t,
+                        )
+                    })
+                    .collect();
+                decorated.sort_unstable_by(|a, b| a.0.cmp(b.0));
+                slots = decorated.into_iter().map(|(_, t)| t).collect();
                 KeyGroup { key_idx, slots }
             })
             .collect();
 
-        // Sort keys by key string.
-        keys.sort_by(|a, b| {
-            strings
-                .substring_raw(a.key_idx as usize)
-                .cmp(strings.substring_raw(b.key_idx as usize))
-        });
+        // Same decorate-sort-undecorate for the key-string sort.
+        let mut decorated: Vec<(&[u8], KeyGroup)> = keys
+            .into_iter()
+            .map(|group| (strings.substring_raw(group.key_idx as usize), group))
+            .collect();
+        decorated.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        keys = decorated.into_iter().map(|(_, group)| group).collect();
 
         Dictionary { keys }
     }
