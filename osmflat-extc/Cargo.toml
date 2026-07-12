@@ -21,6 +21,7 @@ flatdata.workspace = true
 clap = { version = "4.1", features = ["derive"] }
 memmap2 = "0.9"
 tempfile = "3"
+rustc-hash = "2.1.3"
 
 [dev-dependencies]
 tempfile = "3"

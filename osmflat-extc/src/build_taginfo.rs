@@ -22,7 +22,8 @@ use crate::scratch::{Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
 use osmflat_ext::TaginfoBuilder;
-use std::collections::{HashMap, HashSet};
+use rustc_hash::FxHashMap;
+use std::collections::HashMap;
 
 /// CSR postings for one entity type, slot positions in dictionary order.
 struct TypeCsr {
@@ -222,18 +223,22 @@ struct TagCombo {
 impl Cooccurrences {
     fn build(parent: &Osm) -> Self {
         let tags = parent.tags();
-        let mut key_counts: HashMap<(u64, u64), u64> = HashMap::new();
-        let mut tag_counts: HashMap<(u64, u64), u64> = HashMap::new();
+        // (u64, u64)-keyed and hot: the default SipHash-based hasher dominated
+        // profiles here, so use the much cheaper FxHash instead. Pre-sizing
+        // avoids repeated table growth as distinct pairs accumulate.
+        let mut key_counts: FxHashMap<(u64, u64), u64> =
+            FxHashMap::with_capacity_and_hasher(tags.len(), Default::default());
+        let mut tag_counts: FxHashMap<(u64, u64), u64> =
+            FxHashMap::with_capacity_and_hasher(tags.len(), Default::default());
 
-        for slots in entity_tag_sets(parent) {
-            let mut keys = Vec::with_capacity(slots.len());
-            let mut seen_keys = HashSet::with_capacity(slots.len());
-            for &slot in &slots {
-                let key_idx = tags[slot as usize].key_idx();
-                if seen_keys.insert(key_idx) {
-                    keys.push(key_idx);
-                }
-            }
+        // Reused across entities to avoid an alloc/dealloc per entity.
+        let mut keys: Vec<u64> = Vec::new();
+
+        for_each_entity_tag_set(parent, |slots| {
+            keys.clear();
+            keys.extend(slots.iter().map(|&slot| tags[slot as usize].key_idx()));
+            keys.sort_unstable();
+            keys.dedup();
 
             for &key_idx in &keys {
                 for &other_key_idx in &keys {
@@ -243,14 +248,14 @@ impl Cooccurrences {
                 }
             }
 
-            for &slot in &slots {
-                for &other_slot in &slots {
+            for &slot in slots {
+                for &other_slot in slots {
                     if slot != other_slot {
                         *tag_counts.entry((slot, other_slot)).or_default() += 1;
                     }
                 }
             }
-        }
+        });
 
         let strings = parent.stringtable();
         let mut by_key: HashMap<u64, Vec<Combo>> = HashMap::new();
@@ -302,23 +307,22 @@ impl Cooccurrences {
     }
 }
 
-fn entity_tag_sets(parent: &Osm) -> impl Iterator<Item = Vec<u64>> + '_ {
+/// Visits each entity's deduplicated, sorted tag-slot set in turn. Reuses one
+/// buffer across entities instead of allocating a fresh `Vec` per entity.
+fn for_each_entity_tag_set(parent: &Osm, mut visit: impl FnMut(&[u64])) {
     let node_tags = parent.nodes().iter().map(|node| node.tags());
     let way_tags = parent.ways().iter().map(|way| way.tags());
     let relation_tags = parent.relations().iter().map(|relation| relation.tags());
     let tags_index = parent.tags_index();
 
-    node_tags
-        .chain(way_tags)
-        .chain(relation_tags)
-        .map(move |range| {
-            let mut slots: Vec<u64> = range
-                .map(|tag_index_idx| tags_index[tag_index_idx as usize].value())
-                .collect();
-            slots.sort_unstable();
-            slots.dedup();
-            slots
-        })
+    let mut slots: Vec<u64> = Vec::new();
+    for range in node_tags.chain(way_tags).chain(relation_tags) {
+        slots.clear();
+        slots.extend(range.map(|tag_index_idx| tags_index[tag_index_idx as usize].value()));
+        slots.sort_unstable();
+        slots.dedup();
+        visit(&slots);
+    }
 }
 
 /// Emit `keys` / `values` / `*_post` in dictionary order, closing each range
