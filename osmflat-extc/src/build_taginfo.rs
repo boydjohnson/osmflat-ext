@@ -370,9 +370,8 @@ impl Cooccurrences {
         let mut buckets: Vec<BucketSink> = (0..N_TAG_BUCKETS)
             .map(|_| BucketSink::new(mmap_scratch))
             .collect::<Result<_, BuildError>>()?;
-        let bucket_of = |slot: u64| -> usize {
-            ((slot * N_TAG_BUCKETS as u64) / n_slots as u64) as usize
-        };
+        let bucket_of =
+            |slot: u64| -> usize { ((slot * N_TAG_BUCKETS as u64) / n_slots as u64) as usize };
 
         // Reused across entities to avoid an alloc/dealloc per entity.
         let mut keys: Vec<u64> = Vec::new();
