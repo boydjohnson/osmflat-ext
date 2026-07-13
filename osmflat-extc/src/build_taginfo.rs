@@ -252,16 +252,23 @@ impl Cooccurrences {
         let tags = parent.tags();
         let mut phase_start = std::time::Instant::now();
 
-        // OSM tagging is highly repetitive — many entities share an exactly
-        // identical key set / tag set (e.g. thousands of residential ways
-        // all tagged {highway,name,surface,...}). The O(k^2) pairwise count
-        // below only actually needs to run once per *distinct* signature,
-        // scaled by how many entities have it, instead of once per entity.
-        // `get_mut` looks the signature up by borrowed slice, so a repeat
-        // (the common case) costs no allocation; only a never-seen-before
-        // signature pays for the owned `Vec` key.
+        // OSM tagging is highly repetitive at the *key* level — many
+        // entities share an exactly identical key set (e.g. thousands of
+        // residential ways all tagged {highway,name,surface,...}) even
+        // though their exact tag *values* differ (distinct street names).
+        // So grouping by key-set signature and counting each once, scaled
+        // by its entity count, is a real win. The analogous grouping for
+        // exact tag-value sets is not: most entities carry a unique `name`
+        // tag, so their slot-set signature is close to unique anyway —
+        // tried it, and paying to store an owned `Vec<u64>` signature per
+        // near-unique entity pushed the system into swap thrashing on a
+        // real dataset for no counting savings. So `tag_counts` stays a
+        // direct per-entity pairwise count.
+        // `get_mut` looks the key-set signature up by borrowed slice, so a
+        // repeat (the common case) costs no allocation; only a
+        // never-seen-before signature pays for the owned `Vec` key.
         let mut key_set_counts: FxHashMap<Vec<u64>, u64> = FxHashMap::default();
-        let mut slot_set_counts: FxHashMap<Vec<u64>, u64> = FxHashMap::default();
+        let mut tag_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
 
         // Reused across entities to avoid an alloc/dealloc per entity.
         let mut keys: Vec<u64> = Vec::new();
@@ -278,14 +285,16 @@ impl Cooccurrences {
                 key_set_counts.insert(keys.clone(), 1);
             }
 
-            if let Some(count) = slot_set_counts.get_mut(slots) {
-                *count += 1;
-            } else {
-                slot_set_counts.insert(slots.to_vec(), 1);
+            for &slot in slots {
+                for &other_slot in slots {
+                    if slot != other_slot {
+                        *tag_counts.entry((slot, other_slot)).or_default() += 1;
+                    }
+                }
             }
         });
         eprintln!(
-            "[cooccurrences] group signatures: {:?}",
+            "[cooccurrences] group keys + count tag pairs: {:?}",
             phase_start.elapsed()
         );
         phase_start = std::time::Instant::now();
@@ -300,18 +309,10 @@ impl Cooccurrences {
                 }
             }
         }
-
-        let mut tag_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
-        for (group_slots, &count) in &slot_set_counts {
-            for &slot in group_slots {
-                for &other_slot in group_slots {
-                    if slot != other_slot {
-                        *tag_counts.entry((slot, other_slot)).or_default() += count;
-                    }
-                }
-            }
-        }
-        eprintln!("[cooccurrences] count pairs: {:?}", phase_start.elapsed());
+        eprintln!(
+            "[cooccurrences] count key pairs: {:?}",
+            phase_start.elapsed()
+        );
         phase_start = std::time::Instant::now();
 
         let strings = parent.stringtable();
@@ -347,22 +348,34 @@ impl Cooccurrences {
         }
 
         for combos in by_tag.values_mut() {
-            combos.sort_by(|a, b| {
-                let a_tag = &tags[a.other_slot as usize];
-                let b_tag = &tags[b.other_slot as usize];
-                b.together_count
-                    .cmp(&a.together_count)
-                    .then_with(|| {
-                        strings
-                            .substring_raw(a_tag.key_idx() as usize)
-                            .cmp(strings.substring_raw(b_tag.key_idx() as usize))
-                    })
-                    .then_with(|| {
-                        strings
-                            .substring_raw(a_tag.value_idx() as usize)
-                            .cmp(strings.substring_raw(b_tag.value_idx() as usize))
-                    })
+            // Resolve each combo's key/value strings once and sort on the
+            // cached slices — `sort_by` re-ran `substring_raw` on every
+            // comparison (twice per comparison here), re-fetching the same
+            // strings O(log n) times each.
+            let mut decorated: Vec<(u64, &[u8], &[u8], u64)> = combos
+                .iter()
+                .map(|c| {
+                    let tag = &tags[c.other_slot as usize];
+                    (
+                        c.together_count,
+                        strings.substring_raw(tag.key_idx() as usize),
+                        strings.substring_raw(tag.value_idx() as usize),
+                        c.other_slot,
+                    )
+                })
+                .collect();
+            decorated.sort_unstable_by(|a, b| {
+                b.0.cmp(&a.0)
+                    .then_with(|| a.1.cmp(b.1))
+                    .then_with(|| a.2.cmp(b.2))
             });
+            *combos = decorated
+                .into_iter()
+                .map(|(together_count, _, _, other_slot)| TagCombo {
+                    other_slot,
+                    together_count,
+                })
+                .collect();
         }
         eprintln!(
             "[cooccurrences] by_tag build+sort: {:?}",
