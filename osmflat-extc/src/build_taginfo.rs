@@ -250,13 +250,10 @@ struct TagCombo {
 impl Cooccurrences {
     fn build(parent: &Osm) -> Self {
         let tags = parent.tags();
-        // (u64, u64)-keyed and hot: the default SipHash-based hasher dominated
-        // profiles here, so use the much cheaper FxHash instead. Pre-sizing
-        // avoids repeated table growth as distinct pairs accumulate.
-        let mut key_counts: FxHashMap<(u64, u64), u64> =
-            FxHashMap::with_capacity_and_hasher(tags.len(), Default::default());
-        let mut tag_counts: FxHashMap<(u64, u64), u64> =
-            FxHashMap::with_capacity_and_hasher(tags.len(), Default::default());
+        let mut phase_start = std::time::Instant::now();
+
+        let mut key_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+        let mut tag_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
 
         // Reused across entities to avoid an alloc/dealloc per entity.
         let mut keys: Vec<u64> = Vec::new();
@@ -283,6 +280,8 @@ impl Cooccurrences {
                 }
             }
         });
+        eprintln!("[cooccurrences] count pairs: {:?}", phase_start.elapsed());
+        phase_start = std::time::Instant::now();
 
         let strings = parent.stringtable();
         let mut by_key: HashMap<u64, Vec<Combo>> = HashMap::new();
@@ -302,6 +301,11 @@ impl Cooccurrences {
                 })
             });
         }
+        eprintln!(
+            "[cooccurrences] by_key build+sort: {:?}",
+            phase_start.elapsed()
+        );
+        phase_start = std::time::Instant::now();
 
         let mut by_tag: HashMap<u64, Vec<TagCombo>> = HashMap::new();
         for ((slot, other_slot), together_count) in tag_counts {
@@ -329,6 +333,10 @@ impl Cooccurrences {
                     })
             });
         }
+        eprintln!(
+            "[cooccurrences] by_tag build+sort: {:?}",
+            phase_start.elapsed()
+        );
 
         Self { by_key, by_tag }
     }
