@@ -15,8 +15,12 @@
 //! into CSR offsets, a second pass fills the postings array in final layout.
 //! Every parent-sized array comes from [`Scratch`], so `--mmap-scratch` backs
 //! the build with temp files at planet scale; without it everything stays in
-//! RAM (fine for regional extents). The `--combinations` co-occurrence maps
-//! are the exception: they stay in RAM either way.
+//! RAM (fine for regional extents). The `--combinations` tag-pair
+//! co-occurrence counts are also built count-then-fill over [`Scratch`] (the
+//! number of distinct pairs can run into the billions on a country-scale
+//! extract); the key-pair co-occurrence counts stay in RAM either way, since
+//! they're bounded by distinct key-set signatures, not by near-unique
+//! per-entity value tags.
 
 use crate::scratch::{Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
@@ -122,7 +126,7 @@ pub fn build(
 
     phase_start = std::time::Instant::now();
     let cooccurrences = if opts.combinations {
-        Cooccurrences::build(parent)
+        Cooccurrences::build(parent, &scratch)?
     } else {
         Cooccurrences::default()
     };
@@ -234,7 +238,9 @@ impl Dictionary {
 #[derive(Default)]
 struct Cooccurrences {
     by_key: HashMap<u64, Vec<Combo>>,
-    by_tag: HashMap<u64, Vec<TagCombo>>,
+    /// Indexed directly by tag slot (dense, like `pos` above) rather than a
+    /// `HashMap`: bounded by `n_slots`, same as the postings CSR.
+    by_tag: Vec<Vec<TagCombo>>,
 }
 
 struct Combo {
@@ -248,8 +254,9 @@ struct TagCombo {
 }
 
 impl Cooccurrences {
-    fn build(parent: &Osm) -> Self {
+    fn build(parent: &Osm, scratch: &Scratch) -> Result<Self, BuildError> {
         let tags = parent.tags();
+        let n_slots = tags.len();
         let mut phase_start = std::time::Instant::now();
 
         // OSM tagging is highly repetitive at the *key* level — many
@@ -257,18 +264,32 @@ impl Cooccurrences {
         // residential ways all tagged {highway,name,surface,...}) even
         // though their exact tag *values* differ (distinct street names).
         // So grouping by key-set signature and counting each once, scaled
-        // by its entity count, is a real win. The analogous grouping for
-        // exact tag-value sets is not: most entities carry a unique `name`
-        // tag, so their slot-set signature is close to unique anyway —
-        // tried it, and paying to store an owned `Vec<u64>` signature per
-        // near-unique entity pushed the system into swap thrashing on a
-        // real dataset for no counting savings. So `tag_counts` stays a
-        // direct per-entity pairwise count.
+        // by its entity count, is a real win for `key_counts`/`by_key`
+        // below, which stay small RAM `FxHashMap`s. The analogous grouping
+        // for exact tag-value sets is not: most entities carry a unique
+        // `name` tag, so their slot-set signature is close to unique
+        // anyway — tried it, and paying to store an owned `Vec<u64>`
+        // signature per near-unique entity pushed the system into swap
+        // thrashing on a real dataset for no counting savings.
+        //
+        // The direct per-entity pairwise count has the opposite problem: on
+        // a country-scale extract the number of distinct (slot,
+        // other_slot) pairs runs into the hundreds of millions to billions
+        // (measured on `us.osm.flat`: ~1.7B entities, up to 3.6B raw pair
+        // mentions), which blows well past RAM as a `FxHashMap`. So tag
+        // pairs are counted CSR-style instead, count-then-fill over
+        // `scratch` exactly like the postings build above: a first pass
+        // counts raw (slot, other_slot) *mentions* per row, bounded by
+        // `n_slots` (distinct tag definitions) rather than by the number of
+        // distinct pairs; a second pass fills the mentions into place; each
+        // row is then sorted (cheap integer sort) and run-length-encoded
+        // into final counts. `--mmap-scratch` backs the (potentially huge)
+        // raw mentions array with a temp file instead of RAM.
         // `get_mut` looks the key-set signature up by borrowed slice, so a
         // repeat (the common case) costs no allocation; only a
         // never-seen-before signature pays for the owned `Vec` key.
         let mut key_set_counts: FxHashMap<Vec<u64>, u64> = FxHashMap::default();
-        let mut tag_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
+        let mut tag_offsets = scratch.alloc(n_slots + 1)?;
 
         // Reused across entities to avoid an alloc/dealloc per entity.
         let mut keys: Vec<u64> = Vec::new();
@@ -288,7 +309,7 @@ impl Cooccurrences {
             for &slot in slots {
                 for &other_slot in slots {
                     if slot != other_slot {
-                        *tag_counts.entry((slot, other_slot)).or_default() += 1;
+                        tag_offsets[slot as usize + 1] += 1;
                     }
                 }
             }
@@ -297,6 +318,32 @@ impl Cooccurrences {
             "[cooccurrences] group keys + count tag pairs: {:?}",
             phase_start.elapsed()
         );
+        phase_start = std::time::Instant::now();
+
+        for i in 1..tag_offsets.len() {
+            tag_offsets[i] += tag_offsets[i - 1];
+        }
+        eprintln!(
+            "[cooccurrences] tag pair prefix sum: {:?}",
+            phase_start.elapsed()
+        );
+        phase_start = std::time::Instant::now();
+
+        let mut tag_raw = scratch.alloc(tag_offsets[n_slots] as usize)?;
+        let mut cursors = scratch.alloc_copy(&tag_offsets[..n_slots])?;
+        for_each_entity_tag_set(parent, |slots| {
+            for &slot in slots {
+                for &other_slot in slots {
+                    if slot != other_slot {
+                        let cursor = &mut cursors[slot as usize];
+                        tag_raw[*cursor as usize] = other_slot;
+                        *cursor += 1;
+                    }
+                }
+            }
+        });
+        drop(cursors);
+        eprintln!("[cooccurrences] tag pair fill: {:?}", phase_start.elapsed());
         phase_start = std::time::Instant::now();
 
         let mut key_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
@@ -339,50 +386,55 @@ impl Cooccurrences {
         );
         phase_start = std::time::Instant::now();
 
-        let mut by_tag: HashMap<u64, Vec<TagCombo>> = HashMap::new();
-        for ((slot, other_slot), together_count) in tag_counts {
-            by_tag.entry(slot).or_default().push(TagCombo {
-                other_slot,
-                together_count,
-            });
-        }
+        // Per row: sort the raw mentions (cheap integer sort, no string
+        // lookups) and run-length-encode into counts, then apply the same
+        // small decorate-sort-undecorate ordering (count desc, then
+        // key/value string) `by_key` uses above — each row's *distinct*
+        // other-tag count is bounded (unlike the raw mentions before
+        // dedup), so this final sort is cheap.
+        let mut by_tag: Vec<Vec<TagCombo>> = Vec::with_capacity(n_slots);
+        for slot in 0..n_slots {
+            let row = &mut tag_raw[tag_offsets[slot] as usize..tag_offsets[slot + 1] as usize];
+            row.sort_unstable();
 
-        for combos in by_tag.values_mut() {
-            // Resolve each combo's key/value strings once and sort on the
-            // cached slices — `sort_by` re-ran `substring_raw` on every
-            // comparison (twice per comparison here), re-fetching the same
-            // strings O(log n) times each.
-            let mut decorated: Vec<(u64, &[u8], &[u8], u64)> = combos
-                .iter()
-                .map(|c| {
-                    let tag = &tags[c.other_slot as usize];
-                    (
-                        c.together_count,
-                        strings.substring_raw(tag.key_idx() as usize),
-                        strings.substring_raw(tag.value_idx() as usize),
-                        c.other_slot,
-                    )
-                })
-                .collect();
+            let mut decorated: Vec<(u64, &[u8], &[u8], u64)> = Vec::new();
+            let mut i = 0;
+            while i < row.len() {
+                let other_slot = row[i];
+                let mut j = i + 1;
+                while j < row.len() && row[j] == other_slot {
+                    j += 1;
+                }
+                let other = &tags[other_slot as usize];
+                decorated.push((
+                    (j - i) as u64,
+                    strings.substring_raw(other.key_idx() as usize),
+                    strings.substring_raw(other.value_idx() as usize),
+                    other_slot,
+                ));
+                i = j;
+            }
             decorated.sort_unstable_by(|a, b| {
                 b.0.cmp(&a.0)
                     .then_with(|| a.1.cmp(b.1))
                     .then_with(|| a.2.cmp(b.2))
             });
-            *combos = decorated
-                .into_iter()
-                .map(|(together_count, _, _, other_slot)| TagCombo {
-                    other_slot,
-                    together_count,
-                })
-                .collect();
+            by_tag.push(
+                decorated
+                    .into_iter()
+                    .map(|(together_count, _, _, other_slot)| TagCombo {
+                        other_slot,
+                        together_count,
+                    })
+                    .collect(),
+            );
         }
         eprintln!(
-            "[cooccurrences] by_tag build+sort: {:?}",
+            "[cooccurrences] by_tag row sort + RLE: {:?}",
             phase_start.elapsed()
         );
 
-        Self { by_key, by_tag }
+        Ok(Self { by_key, by_tag })
     }
 }
 
@@ -474,7 +526,7 @@ fn write(
             rels_written += rels.len() as u64;
             values_written += 1;
 
-            if let Some(entries) = combos.by_tag.get(&t) {
+            if let Some(entries) = combos.by_tag.get(t as usize) {
                 for entry in entries {
                     let other = &tags[entry.other_slot as usize];
                     let combo = tag_combo_vec.grow()?;
