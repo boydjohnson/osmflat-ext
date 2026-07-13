@@ -15,12 +15,21 @@
 //! into CSR offsets, a second pass fills the postings array in final layout.
 //! Every parent-sized array comes from [`Scratch`], so `--mmap-scratch` backs
 //! the build with temp files at planet scale; without it everything stays in
-//! RAM (fine for regional extents). The `--combinations` tag-pair
-//! co-occurrence counts are also built count-then-fill over [`Scratch`] (the
-//! number of distinct pairs can run into the billions on a country-scale
-//! extract); the key-pair co-occurrence counts stay in RAM either way, since
-//! they're bounded by distinct key-set signatures, not by near-unique
-//! per-entity value tags.
+//! RAM (fine for regional extents).
+//!
+//! The `--combinations` tag-pair co-occurrence counts use a different
+//! strategy: a direct CSR fill (write each `(slot, other_slot)` mention at
+//! its exact final position) was tried first, but the writes are scattered
+//! across the *whole* raw-mentions array — a row's mentions come from
+//! entities spread across the entire entity scan, not adjacent in time — so
+//! on a country-scale extract the working set thrashes the page cache even
+//! though it's disk-backed, not swap. Instead, mentions are radix-bucketed
+//! by slot into [`N_TAG_BUCKETS`] sequential append-only streams in one
+//! pass (each bucket's writes are purely sequential, the cheapest I/O
+//! pattern), then each bucket — small enough to sort comfortably in RAM —
+//! is sorted and run-length-encoded independently. The key-pair
+//! co-occurrence counts stay in RAM either way, since they're bounded by
+//! distinct key-set signatures, not by near-unique per-entity value tags.
 
 use crate::scratch::{Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
@@ -28,6 +37,9 @@ use osmflat::Osm;
 use osmflat_ext::TaginfoBuilder;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 
 /// CSR postings for one entity type, slot positions in dictionary order.
 struct TypeCsr {
@@ -126,7 +138,7 @@ pub fn build(
 
     phase_start = std::time::Instant::now();
     let cooccurrences = if opts.combinations {
-        Cooccurrences::build(parent, &scratch)?
+        Cooccurrences::build(parent, opts.mmap_scratch.as_deref())?
     } else {
         Cooccurrences::default()
     };
@@ -235,6 +247,71 @@ impl Dictionary {
     }
 }
 
+/// Number of radix buckets tag-pair mentions are partitioned into before
+/// sorting. Chosen so each bucket comfortably fits in RAM even on a
+/// country-scale extract (~3.6B mentions / 256 buckets * 16 bytes/record ≈
+/// 220MB/bucket average); tune up if a single bucket still turns out huge
+/// under real skew. File descriptor cost is negligible (macOS default
+/// `ulimit -n` is in the hundreds of thousands).
+const N_TAG_BUCKETS: usize = 256;
+
+/// Append-only sink for one radix bucket's `(slot, other_slot)` mentions:
+/// a growable RAM buffer without `--mmap-scratch`, or a sequential-write
+/// temp file with it. Either way, writes are purely append/sequential — no
+/// positional seeking — which is what avoids the thrashing a direct CSR
+/// fill into one huge array causes (see module docs).
+enum BucketSink {
+    Ram(Vec<(u64, u64)>),
+    File(BufWriter<File>),
+}
+
+impl BucketSink {
+    fn new(dir: Option<&Path>) -> Result<Self, BuildError> {
+        match dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                Ok(BucketSink::File(BufWriter::new(tempfile::tempfile_in(
+                    dir,
+                )?)))
+            }
+            None => Ok(BucketSink::Ram(Vec::new())),
+        }
+    }
+
+    fn push(&mut self, slot: u64, other_slot: u64) -> Result<(), BuildError> {
+        match self {
+            BucketSink::Ram(v) => v.push((slot, other_slot)),
+            BucketSink::File(w) => {
+                w.write_all(&slot.to_le_bytes())?;
+                w.write_all(&other_slot.to_le_bytes())?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the sink and return all `(slot, other_slot)` records.
+    fn into_records(self) -> Result<Vec<(u64, u64)>, BuildError> {
+        match self {
+            BucketSink::Ram(v) => Ok(v),
+            BucketSink::File(w) => {
+                let mut file = w.into_inner().map_err(|e| e.into_error())?;
+                file.seek(SeekFrom::Start(0))?;
+                let mut buf = Vec::new();
+                file.read_to_end(&mut buf)?;
+                Ok(buf
+                    .chunks_exact(16)
+                    .map(|c| {
+                        (
+                            u64::from_le_bytes(c[0..8].try_into().unwrap()),
+                            u64::from_le_bytes(c[8..16].try_into().unwrap()),
+                        )
+                    })
+                    .collect())
+            }
+        }
+    }
+}
+
 #[derive(Default)]
 struct Cooccurrences {
     by_key: HashMap<u64, Vec<Combo>>,
@@ -254,7 +331,7 @@ struct TagCombo {
 }
 
 impl Cooccurrences {
-    fn build(parent: &Osm, scratch: &Scratch) -> Result<Self, BuildError> {
+    fn build(parent: &Osm, mmap_scratch: Option<&Path>) -> Result<Self, BuildError> {
         let tags = parent.tags();
         let n_slots = tags.len();
         let mut phase_start = std::time::Instant::now();
@@ -276,25 +353,35 @@ impl Cooccurrences {
         // a country-scale extract the number of distinct (slot,
         // other_slot) pairs runs into the hundreds of millions to billions
         // (measured on `us.osm.flat`: ~1.7B entities, up to 3.6B raw pair
-        // mentions), which blows well past RAM as a `FxHashMap`. So tag
-        // pairs are counted CSR-style instead, count-then-fill over
-        // `scratch` exactly like the postings build above: a first pass
-        // counts raw (slot, other_slot) *mentions* per row, bounded by
-        // `n_slots` (distinct tag definitions) rather than by the number of
-        // distinct pairs; a second pass fills the mentions into place; each
-        // row is then sorted (cheap integer sort) and run-length-encoded
-        // into final counts. `--mmap-scratch` backs the (potentially huge)
-        // raw mentions array with a temp file instead of RAM.
+        // mentions). A direct CSR fill into one array sized to the exact
+        // total (like the postings build above) was tried, but each row's
+        // mentions come from entities scattered across the *entire* entity
+        // scan, so writes hit the whole multi-GB array in an order
+        // uncorrelated with physical layout — thrashing the page cache
+        // even backed by `--mmap-scratch` (not swap, but the same shape of
+        // problem: repeated evict/reload of a working set that doesn't
+        // fit). So mentions are radix-bucketed by slot into
+        // `N_TAG_BUCKETS` sequential append-only streams instead — see
+        // module docs.
         // `get_mut` looks the key-set signature up by borrowed slice, so a
         // repeat (the common case) costs no allocation; only a
         // never-seen-before signature pays for the owned `Vec` key.
         let mut key_set_counts: FxHashMap<Vec<u64>, u64> = FxHashMap::default();
-        let mut tag_offsets = scratch.alloc(n_slots + 1)?;
+        let mut buckets: Vec<BucketSink> = (0..N_TAG_BUCKETS)
+            .map(|_| BucketSink::new(mmap_scratch))
+            .collect::<Result<_, BuildError>>()?;
+        let bucket_of = |slot: u64| -> usize {
+            ((slot * N_TAG_BUCKETS as u64) / n_slots as u64) as usize
+        };
 
         // Reused across entities to avoid an alloc/dealloc per entity.
         let mut keys: Vec<u64> = Vec::new();
+        let mut bucket_err = None;
 
         for_each_entity_tag_set(parent, |slots| {
+            if bucket_err.is_some() {
+                return;
+            }
             keys.clear();
             keys.extend(slots.iter().map(|&slot| tags[slot as usize].key_idx()));
             keys.sort_unstable();
@@ -309,41 +396,21 @@ impl Cooccurrences {
             for &slot in slots {
                 for &other_slot in slots {
                     if slot != other_slot {
-                        tag_offsets[slot as usize + 1] += 1;
+                        if let Err(e) = buckets[bucket_of(slot)].push(slot, other_slot) {
+                            bucket_err = Some(e);
+                            return;
+                        }
                     }
                 }
             }
         });
-        eprintln!(
-            "[cooccurrences] group keys + count tag pairs: {:?}",
-            phase_start.elapsed()
-        );
-        phase_start = std::time::Instant::now();
-
-        for i in 1..tag_offsets.len() {
-            tag_offsets[i] += tag_offsets[i - 1];
+        if let Some(e) = bucket_err {
+            return Err(e);
         }
         eprintln!(
-            "[cooccurrences] tag pair prefix sum: {:?}",
+            "[cooccurrences] group keys + bucket tag pairs: {:?}",
             phase_start.elapsed()
         );
-        phase_start = std::time::Instant::now();
-
-        let mut tag_raw = scratch.alloc(tag_offsets[n_slots] as usize)?;
-        let mut cursors = scratch.alloc_copy(&tag_offsets[..n_slots])?;
-        for_each_entity_tag_set(parent, |slots| {
-            for &slot in slots {
-                for &other_slot in slots {
-                    if slot != other_slot {
-                        let cursor = &mut cursors[slot as usize];
-                        tag_raw[*cursor as usize] = other_slot;
-                        *cursor += 1;
-                    }
-                }
-            }
-        });
-        drop(cursors);
-        eprintln!("[cooccurrences] tag pair fill: {:?}", phase_start.elapsed());
         phase_start = std::time::Instant::now();
 
         let mut key_counts: FxHashMap<(u64, u64), u64> = FxHashMap::default();
@@ -386,51 +453,62 @@ impl Cooccurrences {
         );
         phase_start = std::time::Instant::now();
 
-        // Per row: sort the raw mentions (cheap integer sort, no string
-        // lookups) and run-length-encode into counts, then apply the same
-        // small decorate-sort-undecorate ordering (count desc, then
-        // key/value string) `by_key` uses above — each row's *distinct*
-        // other-tag count is bounded (unlike the raw mentions before
-        // dedup), so this final sort is cheap.
-        let mut by_tag: Vec<Vec<TagCombo>> = Vec::with_capacity(n_slots);
-        for slot in 0..n_slots {
-            let row = &mut tag_raw[tag_offsets[slot] as usize..tag_offsets[slot + 1] as usize];
-            row.sort_unstable();
+        // Per bucket: read its mentions back, sort by (slot, other_slot)
+        // (cheap integer sort — no string lookups — and cache-friendly
+        // since the whole bucket is RAM-resident), then run-length-encode
+        // each slot's sub-range into counts and apply the same small
+        // decorate-sort-undecorate ordering (count desc, then key/value
+        // string) `by_key` uses above. Each slot's *distinct* other-tag
+        // count is bounded (unlike its raw mentions before dedup), so this
+        // final sort is cheap.
+        let mut by_tag: Vec<Vec<TagCombo>> = (0..n_slots).map(|_| Vec::new()).collect();
+        for bucket in buckets {
+            let mut records = bucket.into_records()?;
+            records.sort_unstable();
 
-            let mut decorated: Vec<(u64, &[u8], &[u8], u64)> = Vec::new();
             let mut i = 0;
-            while i < row.len() {
-                let other_slot = row[i];
+            while i < records.len() {
+                let slot = records[i].0;
                 let mut j = i + 1;
-                while j < row.len() && row[j] == other_slot {
+                while j < records.len() && records[j].0 == slot {
                     j += 1;
                 }
-                let other = &tags[other_slot as usize];
-                decorated.push((
-                    (j - i) as u64,
-                    strings.substring_raw(other.key_idx() as usize),
-                    strings.substring_raw(other.value_idx() as usize),
-                    other_slot,
-                ));
-                i = j;
-            }
-            decorated.sort_unstable_by(|a, b| {
-                b.0.cmp(&a.0)
-                    .then_with(|| a.1.cmp(b.1))
-                    .then_with(|| a.2.cmp(b.2))
-            });
-            by_tag.push(
-                decorated
+                let row = &records[i..j];
+
+                let mut decorated: Vec<(u64, &[u8], &[u8], u64)> = Vec::new();
+                let mut k = 0;
+                while k < row.len() {
+                    let other_slot = row[k].1;
+                    let mut m = k + 1;
+                    while m < row.len() && row[m].1 == other_slot {
+                        m += 1;
+                    }
+                    let other = &tags[other_slot as usize];
+                    decorated.push((
+                        (m - k) as u64,
+                        strings.substring_raw(other.key_idx() as usize),
+                        strings.substring_raw(other.value_idx() as usize),
+                        other_slot,
+                    ));
+                    k = m;
+                }
+                decorated.sort_unstable_by(|a, b| {
+                    b.0.cmp(&a.0)
+                        .then_with(|| a.1.cmp(b.1))
+                        .then_with(|| a.2.cmp(b.2))
+                });
+                by_tag[slot as usize] = decorated
                     .into_iter()
                     .map(|(together_count, _, _, other_slot)| TagCombo {
                         other_slot,
                         together_count,
                     })
-                    .collect(),
-            );
+                    .collect();
+                i = j;
+            }
         }
         eprintln!(
-            "[cooccurrences] by_tag row sort + RLE: {:?}",
+            "[cooccurrences] by_tag bucket sort + RLE: {:?}",
             phase_start.elapsed()
         );
 
