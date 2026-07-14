@@ -23,6 +23,23 @@ struct Args {
     #[arg(long)]
     backrefs: bool,
 
+    /// Build the Multipolygons sub-archive (precomputed relation ring
+    /// assembly, so renderers don't re-stitch outer/inner ways on every
+    /// query).
+    #[arg(long)]
+    multipolygons: bool,
+
+    /// Build the Coastline sub-archive (precomputed global coastline ring
+    /// assembly, classified land/water -- mirrors `osmcoastline`).
+    #[arg(long)]
+    coastline: bool,
+
+    /// Build the LandPolygons sub-archive by importing rings from an
+    /// external, already-closed coastline shapefile (Web Mercator/EPSG:3857),
+    /// e.g. osmdata.openstreetmap.de's `land-polygons` dataset.
+    #[arg(long)]
+    land_polygons: Option<PathBuf>,
+
     /// Also build taginfo key and tag co-occurrence (implies --taginfo).
     #[arg(long)]
     combinations: bool,
@@ -44,12 +61,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let opts = osmflat_extc::BuildOptions {
         taginfo: args.taginfo || args.combinations,
         backrefs: args.backrefs,
+        multipolygons: args.multipolygons,
+        coastline: args.coastline,
+        land_polygons: args.land_polygons,
         combinations: args.combinations,
         mmap_scratch: args.mmap_scratch,
     };
 
-    if !opts.taginfo && !opts.backrefs {
-        eprintln!("nothing to build: pass --taginfo and/or --backrefs");
+    if !opts.taginfo
+        && !opts.backrefs
+        && !opts.multipolygons
+        && !opts.coastline
+        && opts.land_polygons.is_none()
+    {
+        eprintln!(
+            "nothing to build: pass --taginfo, --backrefs, --multipolygons, --coastline, and/or --land-polygons <path>"
+        );
         std::process::exit(2);
     }
 

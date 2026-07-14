@@ -29,7 +29,10 @@
 include!("ext_generated.rs");
 
 pub mod backrefs;
+pub mod coastline;
 pub mod fingerprint;
+pub mod land_polygons;
+pub mod multipolygon;
 pub mod query;
 pub mod spatial;
 pub mod taginfo;
@@ -81,5 +84,27 @@ impl ExtArchive {
     #[inline]
     pub fn backrefs(&self) -> Option<backrefs::BackrefsQuery<'_>> {
         backrefs::BackrefsQuery::new(&self.parent, self.ext.backrefs()?).into()
+    }
+
+    /// Precomputed multipolygon relation queries. `None` if built without
+    /// `--multipolygons`.
+    #[inline]
+    pub fn multipolygons(&self) -> Option<multipolygon::MultipolygonsQuery<'_>> {
+        multipolygon::MultipolygonsQuery::new(&self.parent, self.ext.multipolygons()?).into()
+    }
+
+    /// Precomputed coastline ring queries. `None` if built without
+    /// `--coastline`.
+    #[inline]
+    pub fn coastline(&self) -> Option<coastline::CoastlineQuery<'_>> {
+        coastline::CoastlineQuery::new(&self.parent, self.ext.coastline()?).into()
+    }
+
+    /// Imported external land-polygon queries. `None` if built without
+    /// `--land-polygons`.
+    #[inline]
+    pub fn land_polygons(&self) -> Option<land_polygons::LandPolygonsQuery<'_>> {
+        let scale = self.parent.header().coord_scale() as f64;
+        land_polygons::LandPolygonsQuery::new(self.ext.land_polygons()?, scale).into()
     }
 }

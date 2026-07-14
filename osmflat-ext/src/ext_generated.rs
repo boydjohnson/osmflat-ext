@@ -1045,6 +1045,336 @@ impl Range {
         self.set_first_idx(other.first_idx());
     }
 }
+/// One assembled coastline ring. Unlike `Multipolygons`, this isn't indexed by
+/// relation -- coastline is a plain way tag, and a ring can be stitched from
+/// ways that were never relation members at all.
+#[repr(transparent)]
+pub struct CoastlineRingEntry {
+    data: [u8; 6],
+}
+
+impl CoastlineRingEntry {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 6]}
+    }
+}
+
+impl flatdata::Struct for CoastlineRingEntry {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 6]}
+    }
+
+    const SIZE_IN_BYTES: usize = 6;
+    const IS_OVERLAPPING_WITH_NEXT : bool = true;
+}
+
+impl flatdata::Overlap for CoastlineRingEntry {}
+
+impl CoastlineRingEntry {
+    /// 1 if this ring's interior is land (the ring winds counter-clockwise,
+/// per the `natural=coastline` "land on the left" convention -- the usual
+/// case, an island's or continent's outer boundary); 0 if its interior is
+/// water fully enclosed by coastline (clockwise winding -- rarer, a large
+/// inland sea). See `osmflat_ext::coastline`'s module docs.
+    #[inline]
+    pub fn is_land(&self) -> u8 {
+        let value = flatdata_read_bytes!(u8, self.data.as_ptr(), 0, 1);
+        unsafe { std::mem::transmute::<u8, u8>(value) }
+    }
+
+    /// First element of the range [`nodes`].
+    ///
+    /// [`nodes`]: #method.nodes
+    #[inline]
+    pub fn node_first_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 1, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Range of this ring's vertices in `nodes`.
+    #[inline]
+    pub fn nodes(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 1, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 1 + 6 * 8, 40);
+        start..end
+    }
+
+}
+
+impl std::fmt::Debug for CoastlineRingEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("CoastlineRingEntry")
+            .field("is_land", &self.is_land())
+            .field("node_first_idx", &self.node_first_idx())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for CoastlineRingEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.is_land() == other.is_land() &&        self.node_first_idx() == other.node_first_idx()     }
+}
+
+impl CoastlineRingEntry {
+    /// 1 if this ring's interior is land (the ring winds counter-clockwise,
+/// per the `natural=coastline` "land on the left" convention -- the usual
+/// case, an island's or continent's outer boundary); 0 if its interior is
+/// water fully enclosed by coastline (clockwise winding -- rarer, a large
+/// inland sea). See `osmflat_ext::coastline`'s module docs.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_is_land(&mut self, value: u8) {
+        flatdata_write_bytes!(u8; value, self.data, 0, 1)
+    }
+
+    /// First element of the range [`nodes`].
+    ///
+    /// [`nodes`]: struct.CoastlineRingEntryRef.html#method.nodes
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_node_first_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 1, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &CoastlineRingEntry) {
+        self.set_is_land(other.is_land());
+        self.set_node_first_idx(other.node_first_idx());
+    }
+}
+/// A scaled `(lon, lat)` coordinate, using the **parent archive's own**
+/// `header.coord_scale`, for consistency -- even though this data has no
+/// other correspondence to the parent (see `LandPolygons`'s own docs).
+#[repr(transparent)]
+#[derive(Clone)]
+pub struct Coord {
+    data: [u8; 8],
+}
+
+impl Coord {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 8]}
+    }
+}
+
+impl flatdata::Struct for Coord {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 8]}
+    }
+
+    const SIZE_IN_BYTES: usize = 8;
+    const IS_OVERLAPPING_WITH_NEXT : bool = false;
+}
+
+impl Coord {
+    pub fn new( ) -> Self {
+        Self{data : [0; 8]}
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes(data: &[u8; 8]) -> &Self {
+        // Safety: This is safe since Coord is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array of matching size
+    pub fn from_bytes_mut(data: &mut [u8; 8]) -> &mut Self {
+        // Safety: This is safe since Coord is repr(transparent)
+        unsafe{ std::mem::transmute( data ) }
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice(data: &[u8]) -> Result<&Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 8 {
+            assert_eq!(data.len(), 8);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *const [u8; 8];
+        // Safety: We checked length before
+        Ok(Self::from_bytes(unsafe { &*ptr }))
+    }
+
+    /// Create reference from byte array
+    pub fn from_bytes_slice_mut(data: &mut [u8]) -> Result<&mut Self, flatdata::ResourceStorageError> {
+        // We cannot rely on TryFrom here, since it does not yet support > 33 bytes
+        if data.len() < 8 {
+            assert_eq!(data.len(), 8);
+            return Err(flatdata::ResourceStorageError::UnexpectedDataSize);
+        }
+        let ptr = data.as_ptr() as *mut [u8; 8];
+        // Safety: We checked length before
+        Ok(Self::from_bytes_mut(unsafe { &mut *ptr }))
+    }
+
+    pub fn as_bytes(&self) -> &[u8; 8] {
+        &self.data
+    }
+}
+
+impl Default for Coord {
+    fn default( ) -> Self {
+        Self::new( )
+    }
+}
+
+unsafe impl flatdata::NoOverlap for Coord {}
+
+impl Coord {
+    #[inline]
+    pub fn lon(&self) -> i32 {
+        let value = flatdata_read_bytes!(i32, self.data.as_ptr(), 0, 32);
+        unsafe { std::mem::transmute::<i32, i32>(value) }
+    }
+
+    #[inline]
+    pub fn lat(&self) -> i32 {
+        let value = flatdata_read_bytes!(i32, self.data.as_ptr(), 32, 32);
+        unsafe { std::mem::transmute::<i32, i32>(value) }
+    }
+
+}
+
+impl std::fmt::Debug for Coord {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Coord")
+            .field("lon", &self.lon())
+            .field("lat", &self.lat())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for Coord {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.lon() == other.lon() &&        self.lat() == other.lat()     }
+}
+
+impl Coord {
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_lon(&mut self, value: i32) {
+        flatdata_write_bytes!(i32; value, self.data, 0, 32)
+    }
+
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_lat(&mut self, value: i32) {
+        flatdata_write_bytes!(i32; value, self.data, 32, 32)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &Coord) {
+        self.set_lon(other.lon());
+        self.set_lat(other.lat());
+    }
+}
+/// One ring imported from an external land-polygons dataset.
+#[repr(transparent)]
+pub struct LandPolygonRingEntry {
+    data: [u8; 6],
+}
+
+impl LandPolygonRingEntry {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 6]}
+    }
+}
+
+impl flatdata::Struct for LandPolygonRingEntry {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 6]}
+    }
+
+    const SIZE_IN_BYTES: usize = 6;
+    const IS_OVERLAPPING_WITH_NEXT : bool = true;
+}
+
+impl flatdata::Overlap for LandPolygonRingEntry {}
+
+impl LandPolygonRingEntry {
+    /// 1 if this ring should be painted as land; 0 if it's a hole (e.g. a
+/// lake within a landmass) that should be left as background/water.
+/// Derived the same way as `CoastlineRingEntry.is_land` -- our own
+/// signed-area computation on the (already reprojected) ring, not by
+/// trusting the source dataset's own stated winding convention.
+    #[inline]
+    pub fn is_land(&self) -> u8 {
+        let value = flatdata_read_bytes!(u8, self.data.as_ptr(), 0, 1);
+        unsafe { std::mem::transmute::<u8, u8>(value) }
+    }
+
+    /// First element of the range [`coords`].
+    ///
+    /// [`coords`]: #method.coords
+    #[inline]
+    pub fn coord_first_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 1, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Range of this ring's vertices in `coords`.
+    #[inline]
+    pub fn coords(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 1, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 1 + 6 * 8, 40);
+        start..end
+    }
+
+}
+
+impl std::fmt::Debug for LandPolygonRingEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("LandPolygonRingEntry")
+            .field("is_land", &self.is_land())
+            .field("coord_first_idx", &self.coord_first_idx())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for LandPolygonRingEntry {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.is_land() == other.is_land() &&        self.coord_first_idx() == other.coord_first_idx()     }
+}
+
+impl LandPolygonRingEntry {
+    /// 1 if this ring should be painted as land; 0 if it's a hole (e.g. a
+/// lake within a landmass) that should be left as background/water.
+/// Derived the same way as `CoastlineRingEntry.is_land` -- our own
+/// signed-area computation on the (already reprojected) ring, not by
+/// trusting the source dataset's own stated winding convention.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_is_land(&mut self, value: u8) {
+        flatdata_write_bytes!(u8; value, self.data, 0, 1)
+    }
+
+    /// First element of the range [`coords`].
+    ///
+    /// [`coords`]: struct.LandPolygonRingEntryRef.html#method.coords
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_coord_first_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 1, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &LandPolygonRingEntry) {
+        self.set_is_land(other.is_land());
+        self.set_coord_first_idx(other.coord_first_idx());
+    }
+}
 
 
 
@@ -1733,6 +2063,549 @@ impl BackrefsBuilder {
 
 
 
+/// Precomputed multipolygon relation assembly.
+///
+/// A `type=multipolygon`/`type=boundary` relation's outer/inner member ways
+/// have to be stitched end-to-end into closed rings before they mean anything
+/// as an area -- the same ring-assembly work `osmflat-mapnik-plugin`'s live
+/// rendering path otherwise repeats on every single render query. This
+/// archive does that stitching once, at sidecar-build time (`osmflat-extc
+/// --multipolygons`), mirroring how the wider OSM rendering ecosystem handles
+/// the equivalent coastline-assembly problem with a dedicated offline tool
+/// (`osmcoastline`) rather than live, per-query assembly.
+///
+/// Rings are stored as **parent node indices**, not coordinates -- consistent
+/// with every other resource in this archive, a sidecar holds parent indices,
+/// never a copy of parent data. A query resolves each node index's `(lon,
+/// lat)` from the parent `nodes` vector directly.
+///
+/// Relations that aren't area relations, or whose outer ways don't assemble
+/// into at least one closed ring, get an empty `rel_polygon_range` slice here
+/// (zero polygons) -- callers needing the leftover *open* chains for such
+/// relations (rare; mostly diagnostic) still need the live assembly path in
+/// `osmflat_ext::multipolygon`, which this archive's builder also uses.
+#[derive(Clone)]
+pub struct Multipolygons {
+    _storage: flatdata::StorageHandle,
+    rel_polygon_range : &'static [super::osm_ext::Range],
+    polygon_ring_range : &'static [super::osm_ext::Range],
+    ring_node_range : &'static [super::osm_ext::Range],
+    nodes : &'static [super::osm_ext::Ref],
+}
+
+impl Multipolygons {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    /// Parallel to parent `relations` (plus a trailing sentinel). Slices
+/// `polygon_ring_range` for this relation's assembled polygons; empty for
+/// non-area relations and relations that failed to close.
+    #[inline]
+    pub fn rel_polygon_range(&self) -> &[super::osm_ext::Range] {
+        self.rel_polygon_range
+    }
+
+    /// One entry per assembled polygon, grouped by relation. Slices
+/// `ring_node_range` for this polygon's rings.
+    #[inline]
+    pub fn polygon_ring_range(&self) -> &[super::osm_ext::Range] {
+        self.polygon_ring_range
+    }
+
+    /// One entry per ring, grouped by polygon. Ring 0 within a polygon's
+/// range is the exterior; any further rings are holes. Slices `nodes`.
+    #[inline]
+    pub fn ring_node_range(&self) -> &[super::osm_ext::Range] {
+        self.ring_node_range
+    }
+
+    /// Assembled ring vertices as parent node indices, in stitched order
+/// (first index == last index, closing the ring). Grouped by ring.
+    #[inline]
+    pub fn nodes(&self) -> &[super::osm_ext::Ref] {
+        self.nodes
+    }
+
+}
+
+impl ::std::fmt::Debug for Multipolygons {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("Multipolygons")
+            .field("rel_polygon_range", &self.rel_polygon_range())
+            .field("polygon_ring_range", &self.polygon_ring_range())
+            .field("ring_node_range", &self.ring_node_range())
+            .field("nodes", &self.nodes())
+            .finish()
+    }
+}
+
+impl Multipolygons {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("Multipolygons"), schema::multipolygons::MULTIPOLYGONS)?;
+
+        let rel_polygon_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("rel_polygon_range", schema::multipolygons::resources::REL_POLYGON_RANGE));
+            check("rel_polygon_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let polygon_ring_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("polygon_ring_range", schema::multipolygons::resources::POLYGON_RING_RANGE));
+            check("polygon_ring_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let ring_node_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("ring_node_range", schema::multipolygons::resources::RING_NODE_RANGE));
+            check("ring_node_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let nodes = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("nodes", schema::multipolygons::resources::NODES));
+            check("nodes", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            rel_polygon_range,
+            polygon_ring_range,
+            ring_node_range,
+            nodes,
+        })
+    }
+}
+
+/// Builder for creating [`Multipolygons`] archives.
+///
+///[`Multipolygons`]: struct.Multipolygons.html
+#[derive(Clone, Debug)]
+pub struct MultipolygonsBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl MultipolygonsBuilder {
+    #[inline]
+    /// Stores [`rel_polygon_range`] in the archive.
+    ///
+    /// [`rel_polygon_range`]: struct.Multipolygons.html#method.rel_polygon_range
+    pub fn set_rel_polygon_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("rel_polygon_range", schema::multipolygons::resources::REL_POLYGON_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`rel_polygon_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`rel_polygon_range`]: struct.Multipolygons.html#method.rel_polygon_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_rel_polygon_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "rel_polygon_range", schema::multipolygons::resources::REL_POLYGON_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`polygon_ring_range`] in the archive.
+    ///
+    /// [`polygon_ring_range`]: struct.Multipolygons.html#method.polygon_ring_range
+    pub fn set_polygon_ring_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("polygon_ring_range", schema::multipolygons::resources::POLYGON_RING_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`polygon_ring_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`polygon_ring_range`]: struct.Multipolygons.html#method.polygon_ring_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_polygon_ring_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "polygon_ring_range", schema::multipolygons::resources::POLYGON_RING_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`ring_node_range`] in the archive.
+    ///
+    /// [`ring_node_range`]: struct.Multipolygons.html#method.ring_node_range
+    pub fn set_ring_node_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("ring_node_range", schema::multipolygons::resources::RING_NODE_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`ring_node_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`ring_node_range`]: struct.Multipolygons.html#method.ring_node_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_ring_node_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "ring_node_range", schema::multipolygons::resources::RING_NODE_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`nodes`] in the archive.
+    ///
+    /// [`nodes`]: struct.Multipolygons.html#method.nodes
+    pub fn set_nodes(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("nodes", schema::multipolygons::resources::NODES, vector.as_bytes())
+    }
+
+    /// Opens [`nodes`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`nodes`]: struct.Multipolygons.html#method.nodes
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_nodes(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "nodes", schema::multipolygons::resources::NODES)
+    }
+
+}
+
+impl MultipolygonsBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("Multipolygons", schema::multipolygons::MULTIPOLYGONS, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
+
+
+
+/// Precomputed global coastline assembly: every `natural=coastline` way in the
+/// archive stitched into closed rings, once, at build time
+/// (`osmflat-extc --coastline`) -- mirroring how `osmcoastline` does the
+/// equivalent job for the standard OSM rendering pipeline, rather than leaving
+/// renderers with only a coastline *line* and no fillable area (the gap this
+/// project found for the open ocean, the Harlem River, and the Upper/Lower
+/// New York Bay connection at the Narrows -- all mapped as coastline banks
+/// with no separate water polygon).
+#[derive(Clone)]
+pub struct Coastline {
+    _storage: flatdata::StorageHandle,
+    rings : &'static [super::osm_ext::CoastlineRingEntry],
+    nodes : &'static [super::osm_ext::Ref],
+}
+
+impl Coastline {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    /// One entry per assembled ring, sorted by enclosed area **descending**.
+/// Rendering rings in this order (largest first) with a plain painter's
+/// algorithm reconstructs arbitrarily deep nesting -- an island in a bay
+/// in a sea in a larger bay -- with no explicit hole/exterior pairing.
+    #[inline]
+    pub fn rings(&self) -> &[super::osm_ext::CoastlineRingEntry] {
+        self.rings
+    }
+
+    /// Ring vertices as parent node indices, in stitched order (first index
+/// == last index, closing the ring). Grouped by ring.
+    #[inline]
+    pub fn nodes(&self) -> &[super::osm_ext::Ref] {
+        self.nodes
+    }
+
+}
+
+impl ::std::fmt::Debug for Coastline {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("Coastline")
+            .field("rings", &self.rings())
+            .field("nodes", &self.nodes())
+            .finish()
+    }
+}
+
+impl Coastline {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("Coastline"), schema::coastline::COASTLINE)?;
+
+        let rings = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("rings", schema::coastline::resources::RINGS));
+            check("rings", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::CoastlineRingEntry]>::from_bytes(x)))?
+        };
+        let nodes = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("nodes", schema::coastline::resources::NODES));
+            check("nodes", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            rings,
+            nodes,
+        })
+    }
+}
+
+/// Builder for creating [`Coastline`] archives.
+///
+///[`Coastline`]: struct.Coastline.html
+#[derive(Clone, Debug)]
+pub struct CoastlineBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl CoastlineBuilder {
+    #[inline]
+    /// Stores [`rings`] in the archive.
+    ///
+    /// [`rings`]: struct.Coastline.html#method.rings
+    pub fn set_rings(&self, vector: &[super::osm_ext::CoastlineRingEntry]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("rings", schema::coastline::resources::RINGS, vector.as_bytes())
+    }
+
+    /// Opens [`rings`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`rings`]: struct.Coastline.html#method.rings
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_rings(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::CoastlineRingEntry>> {
+        flatdata::create_external_vector(&*self.storage, "rings", schema::coastline::resources::RINGS)
+    }
+
+    #[inline]
+    /// Stores [`nodes`] in the archive.
+    ///
+    /// [`nodes`]: struct.Coastline.html#method.nodes
+    pub fn set_nodes(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("nodes", schema::coastline::resources::NODES, vector.as_bytes())
+    }
+
+    /// Opens [`nodes`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`nodes`]: struct.Coastline.html#method.nodes
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_nodes(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "nodes", schema::coastline::resources::NODES)
+    }
+
+}
+
+impl CoastlineBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("Coastline", schema::coastline::COASTLINE, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
+
+
+
+/// Land polygons imported from an external, already-closed coastline dataset
+/// (`osmflat-extc --land-polygons <shapefile-dir>`) -- typically the
+/// `land-polygons` (or `water-polygons`) dataset published at
+/// osmdata.openstreetmap.de, the same data the standard OSM rendering
+/// pipeline's `osmcoastline`-based tooling produces and consumes. Unlike
+/// every other resource in this archive, ring vertices here are **not**
+/// parent node indices: this data doesn't come from the parent archive at
+/// all (it has no OSM ids, no correspondence to any parent node), so it's
+/// stored as raw coordinates instead -- a deliberate, documented exception to
+/// this sidecar's usual "store indices, not data" rule. This is what
+/// `osmflat-mapnik-plugin`'s own coastline-assembly-from-scratch approach
+/// (`Coastline`, above) could not solve on its own: a mainland coastline
+/// chain never closes into a ring using only what's in a country-clipped OSM
+/// extract (it runs off toward an inland border with no coastline tag at
+/// all), and neither does a single-direction ray-cast test generalize to
+/// open chains (see the project's notes -- this is a real, verified
+/// mathematical limitation, not a bug). A dataset that was properly closed
+/// against the real global coastline (planet-scale, not clipped to any one
+/// country) sidesteps the problem entirely.
+#[derive(Clone)]
+pub struct LandPolygons {
+    _storage: flatdata::StorageHandle,
+    rings : &'static [super::osm_ext::LandPolygonRingEntry],
+    coords : &'static [super::osm_ext::Coord],
+}
+
+impl LandPolygons {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    /// One entry per ring, sorted by enclosed area **descending** -- same
+/// painter's-algorithm convention as `Coastline`.
+    #[inline]
+    pub fn rings(&self) -> &[super::osm_ext::LandPolygonRingEntry] {
+        self.rings
+    }
+
+    /// Ring vertices as raw scaled coordinates. Grouped by ring.
+    #[inline]
+    pub fn coords(&self) -> &[super::osm_ext::Coord] {
+        self.coords
+    }
+
+}
+
+impl ::std::fmt::Debug for LandPolygons {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("LandPolygons")
+            .field("rings", &self.rings())
+            .field("coords", &self.coords())
+            .finish()
+    }
+}
+
+impl LandPolygons {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("LandPolygons"), schema::land_polygons::LAND_POLYGONS)?;
+
+        let rings = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("rings", schema::land_polygons::resources::RINGS));
+            check("rings", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::LandPolygonRingEntry]>::from_bytes(x)))?
+        };
+        let coords = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("coords", schema::land_polygons::resources::COORDS));
+            check("coords", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Coord]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            rings,
+            coords,
+        })
+    }
+}
+
+/// Builder for creating [`LandPolygons`] archives.
+///
+///[`LandPolygons`]: struct.LandPolygons.html
+#[derive(Clone, Debug)]
+pub struct LandPolygonsBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl LandPolygonsBuilder {
+    #[inline]
+    /// Stores [`rings`] in the archive.
+    ///
+    /// [`rings`]: struct.LandPolygons.html#method.rings
+    pub fn set_rings(&self, vector: &[super::osm_ext::LandPolygonRingEntry]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("rings", schema::land_polygons::resources::RINGS, vector.as_bytes())
+    }
+
+    /// Opens [`rings`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`rings`]: struct.LandPolygons.html#method.rings
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_rings(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::LandPolygonRingEntry>> {
+        flatdata::create_external_vector(&*self.storage, "rings", schema::land_polygons::resources::RINGS)
+    }
+
+    #[inline]
+    /// Stores [`coords`] in the archive.
+    ///
+    /// [`coords`]: struct.LandPolygons.html#method.coords
+    pub fn set_coords(&self, vector: &[super::osm_ext::Coord]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("coords", schema::land_polygons::resources::COORDS, vector.as_bytes())
+    }
+
+    /// Opens [`coords`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`coords`]: struct.LandPolygons.html#method.coords
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_coords(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Coord>> {
+        flatdata::create_external_vector(&*self.storage, "coords", schema::land_polygons::resources::COORDS)
+    }
+
+}
+
+impl LandPolygonsBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("LandPolygons", schema::land_polygons::LAND_POLYGONS, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
+
+
+
 /// Sibling extension archive for an `osm.Osm` archive. Each capability is an
 /// optional sub-archive, built independently (`--taginfo`, `--backrefs`).
 #[derive(Clone)]
@@ -1743,6 +2616,12 @@ pub struct Ext {
     taginfo : Option<super::osm_ext::Taginfo
 >,
     backrefs : Option<super::osm_ext::Backrefs
+>,
+    multipolygons : Option<super::osm_ext::Multipolygons
+>,
+    coastline : Option<super::osm_ext::Coastline
+>,
+    land_polygons : Option<super::osm_ext::LandPolygons
 >,
 }
 
@@ -1775,6 +2654,24 @@ impl Ext {
         self.backrefs.as_ref()
     }
 
+    /// Precomputed multipolygon relation assembly.
+    #[inline]
+    pub fn multipolygons(&self) -> Option<&super::osm_ext::Multipolygons> {
+        self.multipolygons.as_ref()
+    }
+
+    /// Precomputed global coastline ring assembly.
+    #[inline]
+    pub fn coastline(&self) -> Option<&super::osm_ext::Coastline> {
+        self.coastline.as_ref()
+    }
+
+    /// Land polygons imported from an external, already-closed coastline dataset.
+    #[inline]
+    pub fn land_polygons(&self) -> Option<&super::osm_ext::LandPolygons> {
+        self.land_polygons.as_ref()
+    }
+
 }
 
 impl ::std::fmt::Debug for Ext {
@@ -1784,6 +2681,9 @@ impl ::std::fmt::Debug for Ext {
             .field("stringtable", &self.stringtable())
             .field("taginfo", &self.taginfo())
             .field("backrefs", &self.backrefs())
+            .field("multipolygons", &self.multipolygons())
+            .field("coastline", &self.coastline())
+            .field("land_polygons", &self.land_polygons())
             .finish()
     }
 }
@@ -1824,6 +2724,21 @@ impl Ext {
             let max_size = None;
             check("backrefs", |_| 0, max_size, super::osm_ext::Backrefs::open(storage.subdir("backrefs")))?
         };
+        let multipolygons = {
+            use flatdata::check_optional_resource as check;
+            let max_size = None;
+            check("multipolygons", |_| 0, max_size, super::osm_ext::Multipolygons::open(storage.subdir("multipolygons")))?
+        };
+        let coastline = {
+            use flatdata::check_optional_resource as check;
+            let max_size = None;
+            check("coastline", |_| 0, max_size, super::osm_ext::Coastline::open(storage.subdir("coastline")))?
+        };
+        let land_polygons = {
+            use flatdata::check_optional_resource as check;
+            let max_size = None;
+            check("land_polygons", |_| 0, max_size, super::osm_ext::LandPolygons::open(storage.subdir("land_polygons")))?
+        };
 
         Ok(Self {
             _storage: storage,
@@ -1831,6 +2746,9 @@ impl Ext {
             stringtable,
             taginfo,
             backrefs,
+            multipolygons,
+            coastline,
+            land_polygons,
         })
     }
 }
@@ -1878,6 +2796,33 @@ impl ExtBuilder {
     pub fn backrefs(&self) -> Result<super::osm_ext::BackrefsBuilder, flatdata::ResourceStorageError> {
         let storage = self.storage.subdir("backrefs");
         super::osm_ext::BackrefsBuilder::new(storage)
+    }
+
+    /// Stores [`multipolygons`] in the archive.
+    ///
+    /// [`multipolygons`]: struct.Ext.html#method.multipolygons
+    #[inline]
+    pub fn multipolygons(&self) -> Result<super::osm_ext::MultipolygonsBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("multipolygons");
+        super::osm_ext::MultipolygonsBuilder::new(storage)
+    }
+
+    /// Stores [`coastline`] in the archive.
+    ///
+    /// [`coastline`]: struct.Ext.html#method.coastline
+    #[inline]
+    pub fn coastline(&self) -> Result<super::osm_ext::CoastlineBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("coastline");
+        super::osm_ext::CoastlineBuilder::new(storage)
+    }
+
+    /// Stores [`land_polygons`] in the archive.
+    ///
+    /// [`land_polygons`]: struct.Ext.html#method.land_polygons
+    #[inline]
+    pub fn land_polygons(&self) -> Result<super::osm_ext::LandPolygonsBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("land_polygons");
+        super::osm_ext::LandPolygonsBuilder::new(storage)
     }
 
 }
@@ -2258,6 +3203,241 @@ archive Backrefs
 "#;
 }
 }
+pub mod multipolygons {
+
+pub const MULTIPOLYGONS: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    rel_polygon_range : vector< .osm_ext.Range >;
+    polygon_ring_range : vector< .osm_ext.Range >;
+    ring_node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const REL_POLYGON_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    rel_polygon_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const POLYGON_RING_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    polygon_ring_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const RING_NODE_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    ring_node_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const NODES: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+}
+}
+pub mod coastline {
+
+pub const COASTLINE: &str = r#"namespace osm_ext {
+struct CoastlineRingEntry
+{
+    is_land : u8 : 1;
+    @range( nodes )
+    node_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive Coastline
+{
+    rings : vector< .osm_ext.CoastlineRingEntry >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const RINGS: &str = r#"namespace osm_ext {
+struct CoastlineRingEntry
+{
+    is_land : u8 : 1;
+    @range( nodes )
+    node_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Coastline
+{
+    rings : vector< .osm_ext.CoastlineRingEntry >;
+}
+}
+
+"#;
+pub const NODES: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Coastline
+{
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+}
+}
+pub mod land_polygons {
+
+pub const LAND_POLYGONS: &str = r#"namespace osm_ext {
+struct LandPolygonRingEntry
+{
+    is_land : u8 : 1;
+    @range( coords )
+    coord_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Coord
+{
+    lon : i32 : 32;
+    lat : i32 : 32;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive LandPolygons
+{
+    rings : vector< .osm_ext.LandPolygonRingEntry >;
+    coords : vector< .osm_ext.Coord >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const RINGS: &str = r#"namespace osm_ext {
+struct LandPolygonRingEntry
+{
+    is_land : u8 : 1;
+    @range( coords )
+    coord_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive LandPolygons
+{
+    rings : vector< .osm_ext.LandPolygonRingEntry >;
+}
+}
+
+"#;
+pub const COORDS: &str = r#"namespace osm_ext {
+struct Coord
+{
+    lon : i32 : 32;
+    lat : i32 : 32;
+}
+}
+
+namespace osm_ext {
+archive LandPolygons
+{
+    coords : vector< .osm_ext.Coord >;
+}
+}
+
+"#;
+}
+}
 pub mod ext {
 
 pub const EXT: &str = r#"namespace osm_ext {
@@ -2367,6 +3547,58 @@ archive Backrefs
 }
 
 namespace osm_ext {
+archive Multipolygons
+{
+    rel_polygon_range : vector< .osm_ext.Range >;
+    polygon_ring_range : vector< .osm_ext.Range >;
+    ring_node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+struct CoastlineRingEntry
+{
+    is_land : u8 : 1;
+    @range( nodes )
+    node_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Coastline
+{
+    rings : vector< .osm_ext.CoastlineRingEntry >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+struct LandPolygonRingEntry
+{
+    is_land : u8 : 1;
+    @range( coords )
+    coord_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Coord
+{
+    lon : i32 : 32;
+    lat : i32 : 32;
+}
+}
+
+namespace osm_ext {
+archive LandPolygons
+{
+    rings : vector< .osm_ext.LandPolygonRingEntry >;
+    coords : vector< .osm_ext.Coord >;
+}
+}
+
+namespace osm_ext {
 archive Ext
 {
     @explicit_reference( .osm_ext.ExtHeader.builder_idx, .osm_ext.Ext.stringtable )
@@ -2376,6 +3608,12 @@ archive Ext
     taginfo : archive .osm_ext.Taginfo;
     @optional
     backrefs : archive .osm_ext.Backrefs;
+    @optional
+    multipolygons : archive .osm_ext.Multipolygons;
+    @optional
+    coastline : archive .osm_ext.Coastline;
+    @optional
+    land_polygons : archive .osm_ext.LandPolygons;
 }
 }
 
@@ -2530,6 +3768,119 @@ archive Ext
 {
     @optional
     backrefs : archive .osm_ext.Backrefs;
+}
+}
+
+"#;
+pub const MULTIPOLYGONS: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive Multipolygons
+{
+    rel_polygon_range : vector< .osm_ext.Range >;
+    polygon_ring_range : vector< .osm_ext.Range >;
+    ring_node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+archive Ext
+{
+    @optional
+    multipolygons : archive .osm_ext.Multipolygons;
+}
+}
+
+"#;
+pub const COASTLINE: &str = r#"namespace osm_ext {
+struct CoastlineRingEntry
+{
+    is_land : u8 : 1;
+    @range( nodes )
+    node_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive Coastline
+{
+    rings : vector< .osm_ext.CoastlineRingEntry >;
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+archive Ext
+{
+    @optional
+    coastline : archive .osm_ext.Coastline;
+}
+}
+
+"#;
+pub const LAND_POLYGONS: &str = r#"namespace osm_ext {
+struct LandPolygonRingEntry
+{
+    is_land : u8 : 1;
+    @range( coords )
+    coord_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Coord
+{
+    lon : i32 : 32;
+    lat : i32 : 32;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive LandPolygons
+{
+    rings : vector< .osm_ext.LandPolygonRingEntry >;
+    coords : vector< .osm_ext.Coord >;
+}
+}
+
+namespace osm_ext {
+archive Ext
+{
+    @optional
+    land_polygons : archive .osm_ext.LandPolygons;
 }
 }
 

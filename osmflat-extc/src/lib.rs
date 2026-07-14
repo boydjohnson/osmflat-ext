@@ -9,6 +9,9 @@
 use std::path::{Path, PathBuf};
 
 pub mod build_backrefs;
+pub mod build_coastline;
+pub mod build_land_polygons;
+pub mod build_multipolygons;
 pub mod build_taginfo;
 mod scratch;
 #[cfg(feature = "test-support")]
@@ -21,6 +24,15 @@ pub struct BuildOptions {
     pub taginfo: bool,
     /// Build the Backrefs sub-archive.
     pub backrefs: bool,
+    /// Build the Multipolygons sub-archive (precomputed relation ring assembly).
+    pub multipolygons: bool,
+    /// Build the Coastline sub-archive (precomputed global coastline ring
+    /// assembly, classified land/water).
+    pub coastline: bool,
+    /// Build the LandPolygons sub-archive by importing rings from an
+    /// external, already-closed coastline dataset at this shapefile path
+    /// (e.g. osmdata.openstreetmap.de's `land-polygons`, Web Mercator).
+    pub land_polygons: Option<PathBuf>,
     /// Also build taginfo key and tag co-occurrence.
     pub combinations: bool,
     /// Directory for mmap-backed postings/offset scratch (planet scale).
@@ -92,6 +104,18 @@ pub fn build_into(
     if opts.backrefs {
         let backrefs = builder.backrefs()?;
         build_backrefs::build(parent, &backrefs, opts)?;
+    }
+    if opts.multipolygons {
+        let multipolygons = builder.multipolygons()?;
+        build_multipolygons::build(parent, &multipolygons, opts)?;
+    }
+    if opts.coastline {
+        let coastline = builder.coastline()?;
+        build_coastline::build(parent, &coastline, opts)?;
+    }
+    if let Some(shapefile_path) = &opts.land_polygons {
+        let land_polygons = builder.land_polygons()?;
+        build_land_polygons::build(parent, &land_polygons, shapefile_path, opts)?;
     }
     Ok(())
 }

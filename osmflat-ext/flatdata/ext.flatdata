@@ -176,6 +176,168 @@ archive Backrefs {
 }
 
 // ---------------------------------------------------------------------------
+// Multipolygons: precomputed relation ring assembly
+// ---------------------------------------------------------------------------
+
+/**
+ * Precomputed multipolygon relation assembly.
+ *
+ * A `type=multipolygon`/`type=boundary` relation's outer/inner member ways
+ * have to be stitched end-to-end into closed rings before they mean anything
+ * as an area -- the same ring-assembly work `osmflat-mapnik-plugin`'s live
+ * rendering path otherwise repeats on every single render query. This
+ * archive does that stitching once, at sidecar-build time (`osmflat-extc
+ * --multipolygons`), mirroring how the wider OSM rendering ecosystem handles
+ * the equivalent coastline-assembly problem with a dedicated offline tool
+ * (`osmcoastline`) rather than live, per-query assembly.
+ *
+ * Rings are stored as **parent node indices**, not coordinates -- consistent
+ * with every other resource in this archive, a sidecar holds parent indices,
+ * never a copy of parent data. A query resolves each node index's `(lon,
+ * lat)` from the parent `nodes` vector directly.
+ *
+ * Relations that aren't area relations, or whose outer ways don't assemble
+ * into at least one closed ring, get an empty `rel_polygon_range` slice here
+ * (zero polygons) -- callers needing the leftover *open* chains for such
+ * relations (rare; mostly diagnostic) still need the live assembly path in
+ * `osmflat_ext::multipolygon`, which this archive's builder also uses.
+ */
+archive Multipolygons {
+    /**
+     * Parallel to parent `relations` (plus a trailing sentinel). Slices
+     * `polygon_ring_range` for this relation's assembled polygons; empty for
+     * non-area relations and relations that failed to close.
+     */
+    rel_polygon_range: vector< Range >;
+
+    /**
+     * One entry per assembled polygon, grouped by relation. Slices
+     * `ring_node_range` for this polygon's rings.
+     */
+    polygon_ring_range: vector< Range >;
+
+    /**
+     * One entry per ring, grouped by polygon. Ring 0 within a polygon's
+     * range is the exterior; any further rings are holes. Slices `nodes`.
+     */
+    ring_node_range: vector< Range >;
+
+    /**
+     * Assembled ring vertices as parent node indices, in stitched order
+     * (first index == last index, closing the ring). Grouped by ring.
+     */
+    nodes: vector< Ref >;
+}
+
+// ---------------------------------------------------------------------------
+// Coastline: precomputed global coastline ring assembly + land/water split
+// ---------------------------------------------------------------------------
+
+/**
+ * One assembled coastline ring. Unlike `Multipolygons`, this isn't indexed by
+ * relation -- coastline is a plain way tag, and a ring can be stitched from
+ * ways that were never relation members at all.
+ */
+struct CoastlineRingEntry {
+    /**
+     * 1 if this ring's interior is land (the ring winds counter-clockwise,
+     * per the `natural=coastline` "land on the left" convention -- the usual
+     * case, an island's or continent's outer boundary); 0 if its interior is
+     * water fully enclosed by coastline (clockwise winding -- rarer, a large
+     * inland sea). See `osmflat_ext::coastline`'s module docs.
+     */
+    is_land: u8 : 1;
+    /// Range of this ring's vertices in `nodes`.
+    @range(nodes)
+    node_first_idx: u64 : 40;
+}
+
+/**
+ * Precomputed global coastline assembly: every `natural=coastline` way in the
+ * archive stitched into closed rings, once, at build time
+ * (`osmflat-extc --coastline`) -- mirroring how `osmcoastline` does the
+ * equivalent job for the standard OSM rendering pipeline, rather than leaving
+ * renderers with only a coastline *line* and no fillable area (the gap this
+ * project found for the open ocean, the Harlem River, and the Upper/Lower
+ * New York Bay connection at the Narrows -- all mapped as coastline banks
+ * with no separate water polygon).
+ */
+archive Coastline {
+    /**
+     * One entry per assembled ring, sorted by enclosed area **descending**.
+     * Rendering rings in this order (largest first) with a plain painter's
+     * algorithm reconstructs arbitrarily deep nesting -- an island in a bay
+     * in a sea in a larger bay -- with no explicit hole/exterior pairing.
+     */
+    rings: vector< CoastlineRingEntry >;
+    /**
+     * Ring vertices as parent node indices, in stitched order (first index
+     * == last index, closing the ring). Grouped by ring.
+     */
+    nodes: vector< Ref >;
+}
+
+// ---------------------------------------------------------------------------
+// LandPolygons: imported from an external, already-closed coastline dataset
+// ---------------------------------------------------------------------------
+
+/**
+ * A scaled `(lon, lat)` coordinate, using the **parent archive's own**
+ * `header.coord_scale`, for consistency -- even though this data has no
+ * other correspondence to the parent (see `LandPolygons`'s own docs).
+ */
+struct Coord {
+    lon: i32 : 32;
+    lat: i32 : 32;
+}
+
+/// One ring imported from an external land-polygons dataset.
+struct LandPolygonRingEntry {
+    /**
+     * 1 if this ring should be painted as land; 0 if it's a hole (e.g. a
+     * lake within a landmass) that should be left as background/water.
+     * Derived the same way as `CoastlineRingEntry.is_land` -- our own
+     * signed-area computation on the (already reprojected) ring, not by
+     * trusting the source dataset's own stated winding convention.
+     */
+    is_land: u8 : 1;
+    /// Range of this ring's vertices in `coords`.
+    @range(coords)
+    coord_first_idx: u64 : 40;
+}
+
+/**
+ * Land polygons imported from an external, already-closed coastline dataset
+ * (`osmflat-extc --land-polygons <shapefile-dir>`) -- typically the
+ * `land-polygons` (or `water-polygons`) dataset published at
+ * osmdata.openstreetmap.de, the same data the standard OSM rendering
+ * pipeline's `osmcoastline`-based tooling produces and consumes. Unlike
+ * every other resource in this archive, ring vertices here are **not**
+ * parent node indices: this data doesn't come from the parent archive at
+ * all (it has no OSM ids, no correspondence to any parent node), so it's
+ * stored as raw coordinates instead -- a deliberate, documented exception to
+ * this sidecar's usual "store indices, not data" rule. This is what
+ * `osmflat-mapnik-plugin`'s own coastline-assembly-from-scratch approach
+ * (`Coastline`, above) could not solve on its own: a mainland coastline
+ * chain never closes into a ring using only what's in a country-clipped OSM
+ * extract (it runs off toward an inland border with no coastline tag at
+ * all), and neither does a single-direction ray-cast test generalize to
+ * open chains (see the project's notes -- this is a real, verified
+ * mathematical limitation, not a bug). A dataset that was properly closed
+ * against the real global coastline (planet-scale, not clipped to any one
+ * country) sidesteps the problem entirely.
+ */
+archive LandPolygons {
+    /**
+     * One entry per ring, sorted by enclosed area **descending** -- same
+     * painter's-algorithm convention as `Coastline`.
+     */
+    rings: vector< LandPolygonRingEntry >;
+    /// Ring vertices as raw scaled coordinates. Grouped by ring.
+    coords: vector< Coord >;
+}
+
+// ---------------------------------------------------------------------------
 // Umbrella archive
 // ---------------------------------------------------------------------------
 
@@ -198,6 +360,18 @@ archive Ext {
     /// Reverse references.
     @optional
     backrefs: archive Backrefs;
+
+    /// Precomputed multipolygon relation assembly.
+    @optional
+    multipolygons: archive Multipolygons;
+
+    /// Precomputed global coastline ring assembly.
+    @optional
+    coastline: archive Coastline;
+
+    /// Land polygons imported from an external, already-closed coastline dataset.
+    @optional
+    land_polygons: archive LandPolygons;
 }
 
 } // namespace osm_ext
