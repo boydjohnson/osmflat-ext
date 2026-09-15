@@ -221,14 +221,69 @@ archive Taginfo {
 | entities with `k=v` | slice the three postings | `O(matches)` |
 | `k=v ∩ bbox` | merge-join (§3) | `O(R·log k)` |
 | `k₁=v₁ ∩ k₂=v₂` | merge-join two postings | `O(k₁+k₂)` |
-| key-only `k=*` | union the key's value postings (k-way merge) | `O(Σ matches)` |
-| top values for a key | values pre-sortable by count at build, or sort `O(values)` at query | — |
+| key-only `k=*` | stored key postings (`--key-postings`), else union the key's value postings (k-way merge) | `O(matches)` stored, `O(Σ matches · log values)` merged |
+| top values for a key | `values_by_count` permutation | `O(1)` per value |
+| values containing a substring | trigram index (`--value-search`), else scan | `O(Σ trigram postings + candidates)` indexed |
 
 `key=*` (entities with a key regardless of value) is a k-way merge over the
-key's value postings; each operand is ascending, so it streams. Implemented as
-`KeyView::{nodes, ways, relations}` over `query::union`, with no stored
-key-level postings. If `key=*` turns out hot, add an optional fourth postings
-region per `KeyEntry` (key-level postings) at the cost of duplicating refs.
+key's value postings; each operand is ascending, so it streams
+(`KeyView::{nodes, ways, relations}` over `query::union`). With
+`--key-postings` the sidecar also stores each key's union up front, and the same
+methods read it directly; see below.
+
+### Values by count
+
+`Taginfo.values_by_count: vector<Ref>` is always built with `--taginfo`. For a
+key whose values occupy `[s, e)` in `values`, `values_by_count[s..e]` holds that
+range's indices ordered by total object count (nodes + ways + relations)
+descending, then by value string. It shares the key's existing value range, so
+no new range field is needed; it costs 5 bytes per distinct value. This settles
+§12's value-ordering question: `values` stays string-sorted for exact and
+prefix lookup, and `KeyView::values_by_count` gives taginfo's "most common
+values" without sorting a key's (possibly millions of) values at query time.
+
+### Stored `key=*` postings (`--key-postings`)
+
+An optional `Taginfo.key_postings: archive KeyPostings`: for each entity type, a
+`vector<Range>` parallel to `keys` (plus sentinel) slicing a `vector<Ref>` of
+ascending entity indices. The build streams a k-way merge of each key's value
+postings straight into the output, so no key's list (up to tens of millions of
+entities) is materialized. Readers use it transparently: `KeyView::{nodes,
+ways, relations}`, `KeyView::*_in_bbox`, and `Query::with_key` return the same
+results with or without it (`TaginfoQuery::has_key_postings` reports which).
+Cost: roughly the size of the tag postings again.
+
+### Substring value search (`--value-search`)
+
+An optional `Taginfo.value_search: archive ValueSearch`:
+
+```
+struct Trigram { gram: u32 : 24; @range(values) value_first_idx: u64 : 40; }
+archive ValueSearch {
+    trigrams: vector<Trigram>;   // distinct trigrams, ascending by gram, + sentinel
+    values:   vector<Ref>;       // indices into Taginfo.values, ascending per trigram
+}
+```
+
+A trigram is three bytes of a value string with ASCII letters lowercased
+(`b0 << 16 | b1 << 8 | b2`); non-ASCII bytes are kept as-is, so matching is
+ASCII case-insensitive and byte-exact otherwise. `osmflat_ext::taginfo::
+value_trigrams` defines the encoding for both the builder and readers.
+
+**Query.** `TaginfoQuery::values_containing(pattern)` (all keys) and
+`KeyView::values_containing(pattern)` (one key; the candidates are clipped to
+the key's value range) intersect the pattern's trigram postings smallest-first,
+then confirm each candidate with a case-insensitive substring check. A pattern
+with a trigram absent from the index returns nothing immediately. Patterns
+shorter than 3 bytes, or sidecars without the index, fall back to checking every
+value. Results are in value-index order (grouped by key, value-string order
+within), and `ValueView::key` recovers each hit's key.
+
+**Build.** Count-then-fill: pass 1 counts occurrences per distinct trigram (one
+per value per distinct trigram) in a hash map — distinct trigrams are bounded
+by the byte alphabet actually used, so this and the offsets stay small — and
+pass 2 fills the postings in value order, so each run comes out ascending. The
+postings array comes from `Scratch` and spills to `--mmap-scratch` at scale.
 
 ### Taginfo "combinations" (`--combinations`)
 
@@ -516,6 +571,8 @@ osmflat-extc [OPTIONS] PARENT
   --out DIR                 output Ext archive dir (default: PARENT sibling .ext)
   --taginfo                 build the Taginfo sub-archive
   --combinations            also build taginfo key/tag co-occurrence (implies --taginfo)
+  --key-postings            also store per-key key=* postings (implies --taginfo)
+  --value-search            also build the trigram substring index (implies --taginfo)
   --backrefs                build the Backrefs sub-archive
   --multipolygons           build the Multipolygons sub-archive (§5a)
   --coastline               build the Coastline sub-archive (§5a)
@@ -559,7 +616,8 @@ limitations.
 | `k=v ⊆ k=*` and `k=*` length = key count | `osmflat-extc/tests/synthetic.rs` |
 | `Query` = intersection of each constraint computed on its own (tag / `key=*` scan, bbox query, standalone radius/polygon), across tag × key × spatial combinations and all three entity types; `KeyView::*_in_bbox`; boxes past the world edge; error cases | `osmflat-extc/tests/query_builder.rs` |
 | way / relation radius, polygon, k-NN vs. a brute-force oracle reading the parent with no prefilter (single-node ways, nested / self / cyclic relations, concave and sliver polygons, far and world-corner centers) | `osmflat-extc/tests/way_spatial.rs`; exact primitives at the boundary in `osmflat-ext/src/spatial.rs` unit tests |
-| differential on a real extract | `cargo run --release --example verify` (layout, bounds, sort orders, count sums; sampled membership cross-check) |
+| `values_by_count` order (count desc, string tie-break); stored `key=*` postings equal the merge and a scan (also in bbox, via `Query::with_key`, and with `--mmap-scratch`); substring search equals a case-insensitive scan with and without the index, across all keys and within one key, including non-ASCII and sub-trigram patterns | `osmflat-extc/tests/taginfo_phase4.rs` |
+| differential on a real extract | `cargo run --release --example verify` (layout, bounds, sort orders, count sums; sampled membership cross-check; `values_by_count` permutation and order; key postings ranges and counts; trigram order, coverage, total, and containment) |
 | merge-join commutativity | not yet |
 
 ---
@@ -570,9 +628,10 @@ limitations.
    other/rebuilt parent (caught by the §2 fingerprint, not silently).
 2. **Build cost ≈ data size.** Postings are O(tags_index); planet needs scratch
    disk, like osmflatc's RocksDB phase.
-3. **Substring value search not indexed.** `keys`/`values` are prefix-searchable
-   (string-sorted); arbitrary substring search over ~10⁸ planet values is a scan
-   or a future n-gram sidecar.
+3. **Substring search is limited.** It needs `--value-search` to avoid scanning
+   every value, folds ASCII case only (non-ASCII bytes must match exactly), and
+   scans for patterns shorter than 3 bytes. Keys are exact and prefix searchable
+   only.
 4. **Combinations are only partly external.** `--combinations` spills raw
    tag-pair mentions to `--mmap-scratch`, but key-pair counts, each bucket while
    it is sorted, and the final per-tag co-occurrence lists stay resident; at
@@ -585,6 +644,10 @@ limitations.
 6. **`--coastline` only closes rings.** A mainland coastline in a bounded
    extract is an open chain, so only islands and enclosed water become areas;
    use `--land-polygons` for mainland land fill.
+7. **The format is tied to the builder version.** flatdata compares each
+   archive's stored schema byte-for-byte on open, and `Ext`'s schema includes
+   every sub-archive, so any schema change (even adding an optional resource)
+   makes sidecars from an earlier `osmflat-extc` fail to open. Rebuild them.
 
 ---
 
@@ -598,10 +661,9 @@ limitations.
    builder (`ExtArchive::query()`) composing tags and keys with bbox / radius /
    polygon.
 3. **Done.** `Backrefs` (`--backrefs`).
-4. **Partly done.** Taginfo extensions:
-   - done: `--combinations` (key and tag co-occurrence);
-   - not yet: optional stored `key=*` postings region; substring/n-gram value
-     search; per-key "top-N by count" table.
+4. **Done.** Taginfo extensions: `--combinations` (key and tag co-occurrence);
+   `values_by_count` (per-key values by count, always built); `--key-postings`
+   (stored `key=*` postings); `--value-search` (trigram substring search).
 5. **Done** (added after the original plan). Rendering sub-archives (§5a):
    `--multipolygons`, `--coastline`, `--land-polygons`.
 
@@ -616,10 +678,12 @@ limitations.
   are count-then-fill with `--mmap-scratch` backing.
 - **`key=*` postings** — derive by k-way merge at query time (no storage) vs.
   store a per-key postings region (duplicates refs, ~2× tag postings)?
-  *Currently:* derived at query time (`KeyView::{nodes, ways, relations}`).
+  *Resolved:* both. Derived at query time by default; stored with
+  `--key-postings`, which readers use transparently.
 - **Value ordering within a key** — by string (enables value prefix search) vs.
-  by count desc (enables instant "top values"). String wins for search; add a
-  small per-key "top-N by count" side table if needed.
+  by count desc (enables instant "top values"). *Resolved:* `values` stays
+  string-sorted, and the always-built `values_by_count` permutation (all
+  values, not a fixed top-N) gives count order.
 - **Fingerprint strength** — counts + schema hash, or a full content hash of the
   parent vectors? Counts+schema is cheap and catches rebuilds; a content hash is
   stronger but costs a full parent read at build. *Currently:* counts +

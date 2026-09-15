@@ -579,7 +579,7 @@ impl<'a> Query<'a> {
 }
 
 /// Intersect an ascending `acc` with an ascending iterator `b`.
-fn intersect_sorted(acc: &[u64], b: impl Iterator<Item = u64>) -> Vec<u64> {
+pub(crate) fn intersect_sorted(acc: &[u64], b: impl Iterator<Item = u64>) -> Vec<u64> {
     let mut out = Vec::new();
     let mut i = 0usize;
     for bv in b {

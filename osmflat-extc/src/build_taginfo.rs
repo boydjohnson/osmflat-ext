@@ -34,6 +34,7 @@
 use crate::scratch::{Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
+use osmflat_ext::taginfo::value_trigrams;
 use osmflat_ext::TaginfoBuilder;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
@@ -145,9 +146,167 @@ pub fn build(
     eprintln!("[taginfo] cooccurrences: {:?}", phase_start.elapsed());
 
     phase_start = std::time::Instant::now();
-    let result = write(parent, builder, &dict, &csr, &cooccurrences);
+    write(parent, builder, &dict, &csr, &cooccurrences)?;
     eprintln!("[taginfo] write: {:?}", phase_start.elapsed());
-    result
+
+    if opts.key_postings {
+        phase_start = std::time::Instant::now();
+        write_key_postings(&builder.key_postings()?, &dict, &csr)?;
+        eprintln!("[taginfo] key postings: {:?}", phase_start.elapsed());
+    }
+    drop(csr);
+
+    if opts.value_search {
+        phase_start = std::time::Instant::now();
+        write_value_search(parent, &builder.value_search()?, &dict, &scratch)?;
+        eprintln!("[taginfo] value search: {:?}", phase_start.elapsed());
+    }
+    Ok(())
+}
+
+/// Write `KeyPostings`: per key and type, the ascending union of that key's
+/// value postings, streamed through a k-way merge so no key's `key=*` list is
+/// ever materialized (a key can carry tens of millions of entities).
+fn write_key_postings(
+    builder: &osmflat_ext::KeyPostingsBuilder,
+    dict: &Dictionary,
+    csr: &[TypeCsr; 3],
+) -> Result<(), BuildError> {
+    let mut ranges = [
+        builder.start_node_range()?,
+        builder.start_way_range()?,
+        builder.start_relation_range()?,
+    ];
+    let mut posts = [
+        builder.start_nodes()?,
+        builder.start_ways()?,
+        builder.start_relations()?,
+    ];
+    let mut written = [0u64; 3];
+
+    let mut p = 0usize;
+    for group in &dict.keys {
+        let positions = p..p + group.slots.len();
+        p = positions.end;
+        for ty in 0..3 {
+            ranges[ty].grow()?.set_first_idx(written[ty]);
+            let lists: Vec<&[u64]> = positions.clone().map(|q| csr[ty].at(q)).collect();
+            written[ty] += merge_into(&lists, &mut posts[ty])?;
+        }
+    }
+    for ty in 0..3 {
+        ranges[ty].grow()?.set_first_idx(written[ty]);
+    }
+    for v in ranges {
+        v.close()?;
+    }
+    for v in posts {
+        v.close()?;
+    }
+    Ok(())
+}
+
+/// Stream the ascending, deduplicated union of ascending `lists` into `out`;
+/// returns how many values were written.
+fn merge_into(
+    lists: &[&[u64]],
+    out: &mut flatdata::ExternalVector<osmflat_ext::Ref>,
+) -> Result<u64, BuildError> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
+    let mut heap: BinaryHeap<Reverse<(u64, usize, usize)>> = lists
+        .iter()
+        .enumerate()
+        .filter_map(|(l, list)| list.first().map(|&v| Reverse((v, l, 0))))
+        .collect();
+    let (mut last, mut written) = (None, 0u64);
+    while let Some(Reverse((v, l, i))) = heap.pop() {
+        if let Some(&next) = lists[l].get(i + 1) {
+            heap.push(Reverse((next, l, i + 1)));
+        }
+        if last != Some(v) {
+            out.grow()?.set_value(v);
+            last = Some(v);
+            written += 1;
+        }
+    }
+    Ok(written)
+}
+
+/// Write `ValueSearch`: count-then-fill CSR from each distinct trigram to the
+/// ascending indices (into `Taginfo.values`) of the values containing it.
+///
+/// Distinct trigrams are few (bounded by the byte alphabet actually used), so
+/// their counts and offsets live in RAM; the postings, one per (value, distinct
+/// trigram), come from `scratch` and spill to `--mmap-scratch` at scale.
+fn write_value_search(
+    parent: &Osm,
+    builder: &osmflat_ext::ValueSearchBuilder,
+    dict: &Dictionary,
+    scratch: &Scratch,
+) -> Result<(), BuildError> {
+    let tags = parent.tags();
+    let strings = parent.stringtable();
+    // Values in `Taginfo.values` order: dictionary key order, value-sorted.
+    let values = || {
+        dict.keys
+            .iter()
+            .flat_map(|g| g.slots.iter())
+            .map(|&t| strings.substring_raw(tags[t as usize].value_idx() as usize))
+    };
+
+    // Pass 1: occurrences per distinct trigram.
+    let mut grams = Vec::new();
+    let mut counts: FxHashMap<u32, u64> = FxHashMap::default();
+    for value in values() {
+        value_trigrams(value, &mut grams);
+        for &g in &grams {
+            *counts.entry(g).or_default() += 1;
+        }
+    }
+
+    // Dense ids in gram order; `offsets[id]` starts that trigram's postings.
+    let mut sorted: Vec<(u32, u64)> = counts.into_iter().collect();
+    sorted.sort_unstable();
+    let mut dense: FxHashMap<u32, usize> = FxHashMap::default();
+    let mut offsets = Vec::with_capacity(sorted.len() + 1);
+    let mut total = 0u64;
+    for (id, &(gram, count)) in sorted.iter().enumerate() {
+        dense.insert(gram, id);
+        offsets.push(total);
+        total += count;
+    }
+    offsets.push(total);
+
+    // Pass 2: fill. Values are visited in index order, so each trigram's
+    // postings come out ascending.
+    let mut posts = scratch.alloc(total as usize)?;
+    let mut cursors = offsets.clone();
+    for (value_idx, value) in values().enumerate() {
+        value_trigrams(value, &mut grams);
+        for g in &grams {
+            let id = dense[g];
+            posts[cursors[id] as usize] = value_idx as u64;
+            cursors[id] += 1;
+        }
+    }
+
+    let mut trigram_vec = builder.start_trigrams()?;
+    for (&(gram, _), &first) in sorted.iter().zip(&offsets) {
+        let entry = trigram_vec.grow()?;
+        entry.set_gram(gram);
+        entry.set_value_first_idx(first);
+    }
+    trigram_vec.grow()?.set_value_first_idx(total);
+    trigram_vec.close()?;
+
+    let mut values_vec = builder.start_values()?;
+    for &v in posts.iter() {
+        values_vec.grow()?.set_value(v);
+    }
+    values_vec.close()?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -551,6 +710,8 @@ fn write(
     let mut rel_post = builder.start_rel_post()?;
     let mut combo_vec = builder.start_combos()?;
     let mut tag_combo_vec = builder.start_tag_combos()?;
+    let mut values_by_count = builder.start_values_by_count()?;
+    let mut by_count: Vec<(u64, u64)> = Vec::new();
 
     let (mut values_written, mut nodes_written, mut ways_written, mut rels_written) =
         (0u64, 0u64, 0u64, 0u64);
@@ -568,6 +729,19 @@ fn write(
             cn += csr[0].at(q).len() as u64;
             cw += csr[1].at(q).len() as u64;
             cr += csr[2].at(q).len() as u64;
+        }
+
+        // This key's value indices by total count descending. Values are
+        // written in string order, so the index tie-break is string order.
+        by_count.clear();
+        by_count.extend((0..group.slots.len()).map(|i| {
+            let q = p + i;
+            let total = (csr[0].at(q).len() + csr[1].at(q).len() + csr[2].at(q).len()) as u64;
+            (total, values_written + i as u64)
+        }));
+        by_count.sort_unstable_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        for &(_, value_idx) in &by_count {
+            values_by_count.grow()?.set_value(value_idx);
         }
 
         let key = keys_vec.grow()?;
@@ -643,5 +817,6 @@ fn write(
     rel_post.close()?;
     combo_vec.close()?;
     tag_combo_vec.close()?;
+    values_by_count.close()?;
     Ok(())
 }

@@ -94,6 +94,114 @@ impl<'a> TaginfoQuery<'a> {
     pub fn kv(&self, key: &[u8], value: &[u8]) -> Option<ValueView<'a>> {
         self.key(key)?.value(value)
     }
+
+    /// Whether the sidecar stores precomputed `key=*` postings
+    /// (`osmflat-extc --key-postings`). [`KeyView::nodes`] and friends return
+    /// the same result either way; this only affects speed.
+    pub fn has_key_postings(&self) -> bool {
+        self.taginfo.key_postings().is_some()
+    }
+
+    /// Whether the sidecar has the trigram substring index
+    /// (`osmflat-extc --value-search`). [`Self::values_containing`] returns the
+    /// same result either way; without it, it scans every value.
+    pub fn has_value_search(&self) -> bool {
+        self.taginfo.value_search().is_some()
+    }
+
+    /// Values of any key whose string contains `pattern`, ASCII
+    /// case-insensitively (`"lake"` matches `"Lake Harriet"`; non-ASCII bytes
+    /// must match exactly). Ascending value index: grouped by key in key order,
+    /// value-string order within a key; see [`ValueView::key`].
+    ///
+    /// With the `--value-search` index and a pattern of at least 3 bytes, the
+    /// candidates are the intersection of the pattern's trigram postings, each
+    /// then checked. Otherwise every value is checked.
+    pub fn values_containing(&self, pattern: &[u8]) -> Vec<ValueView<'a>> {
+        self.values_containing_in(0..self.taginfo.values().len(), pattern)
+    }
+
+    /// [`Self::values_containing`] restricted to value indices in `range`.
+    fn values_containing_in(
+        &self,
+        range: std::ops::Range<usize>,
+        pattern: &[u8],
+    ) -> Vec<ValueView<'a>> {
+        let values = self.taginfo.values();
+        let matches =
+            |i: usize| contains_ignore_ascii_case(self.string(values[i].value_idx()), pattern);
+        let hits: Vec<usize> = match self.trigram_candidates(pattern) {
+            Some(candidates) => {
+                let lo = candidates.partition_point(|&v| (v as usize) < range.start);
+                let hi = candidates.partition_point(|&v| (v as usize) < range.end);
+                candidates[lo..hi]
+                    .iter()
+                    .map(|&v| v as usize)
+                    .filter(|&i| matches(i))
+                    .collect()
+            }
+            None => range.filter(|&i| matches(i)).collect(),
+        };
+        hits.into_iter()
+            .map(|idx| ValueView { q: *self, idx })
+            .collect()
+    }
+
+    /// Ascending value indices containing every trigram of `pattern`, or
+    /// `None` when there's no index or the pattern is too short to use it.
+    fn trigram_candidates(&self, pattern: &[u8]) -> Option<Vec<u64>> {
+        if pattern.len() < 3 {
+            return None;
+        }
+        let search = self.taginfo.value_search()?;
+        let (trigrams, postings) = (search.trigrams(), search.values());
+        let mut grams = Vec::new();
+        value_trigrams(pattern, &mut grams);
+
+        let mut lists: Vec<&[Ref]> = Vec::with_capacity(grams.len());
+        for gram in grams {
+            let Ok(i) = trigrams.binary_search_by_key(&gram, |t| t.gram()) else {
+                return Some(Vec::new());
+            };
+            let r = trigrams[i].values();
+            lists.push(&postings[r.start as usize..r.end as usize]);
+        }
+        lists.sort_by_key(|l| l.len());
+        let mut acc: Vec<u64> = lists[0].iter().map(|r| r.value()).collect();
+        for list in &lists[1..] {
+            if acc.is_empty() {
+                break;
+            }
+            acc = crate::query::intersect_sorted(&acc, list.iter().map(|r| r.value()));
+        }
+        Some(acc)
+    }
+}
+
+/// The distinct trigrams of `value` as indexed by the `ValueSearch`
+/// sub-archive: every 3-byte window, ASCII-lowercased, encoded
+/// `b0 << 16 | b1 << 8 | b2`, sorted and deduplicated into `out`.
+///
+/// `osmflat-extc` builds the index with this function, so readers and the
+/// builder always agree.
+pub fn value_trigrams(value: &[u8], out: &mut Vec<u32>) {
+    out.clear();
+    out.extend(value.windows(3).map(|w| {
+        u32::from(w[0].to_ascii_lowercase()) << 16
+            | u32::from(w[1].to_ascii_lowercase()) << 8
+            | u32::from(w[2].to_ascii_lowercase())
+    }));
+    out.sort_unstable();
+    out.dedup();
+}
+
+/// Whether `haystack` contains `needle`, comparing ASCII letters
+/// case-insensitively.
+fn contains_ignore_ascii_case(haystack: &[u8], needle: &[u8]) -> bool {
+    needle.is_empty()
+        || haystack
+            .windows(needle.len())
+            .any(|w| w.eq_ignore_ascii_case(needle))
 }
 
 /// A distinct key with its aggregate stats and value list.
@@ -149,23 +257,47 @@ impl<'a> KeyView<'a> {
         (r.start..r.end).map(move |i| ValueView { q, idx: i as usize })
     }
 
+    /// The distinct values for this key, most common first: by total object
+    /// count (nodes + ways + relations) descending, then by value string.
+    pub fn values_by_count(&self) -> impl Iterator<Item = ValueView<'a>> + 'a {
+        let r = self.entry().values();
+        let q = self.q;
+        q.taginfo.values_by_count()[r.start as usize..r.end as usize]
+            .iter()
+            .map(move |v| ValueView {
+                q,
+                idx: v.value() as usize,
+            })
+    }
+
+    /// This key's values whose string contains `pattern`, ASCII
+    /// case-insensitively, in value-string order. See
+    /// [`TaginfoQuery::values_containing`].
+    pub fn values_containing(&self, pattern: &[u8]) -> Vec<ValueView<'a>> {
+        let r = self.entry().values();
+        self.q
+            .values_containing_in(r.start as usize..r.end as usize, pattern)
+    }
+
     /// Nodes carrying this key with any value (`key=*`), ascending parent node
     /// indices.
     ///
-    /// A lazy k-way merge ([`crate::query::union`]) over this key's per-value
-    /// node postings: no stored key-level postings, `O(values)` memory.
+    /// Read directly from the stored key postings when the sidecar was built
+    /// with `--key-postings`; otherwise a lazy k-way merge
+    /// ([`crate::query::union`]) over this key's per-value node postings, in
+    /// `O(values)` memory. Both give the same result.
     pub fn nodes(&self) -> impl Iterator<Item = u64> + 'a {
-        crate::query::union(&self.postings(ValueView::nodes))
+        self.postings_of(EntityType::Node)
     }
 
     /// Ways carrying this key with any value (`key=*`). See [`Self::nodes`].
     pub fn ways(&self) -> impl Iterator<Item = u64> + 'a {
-        crate::query::union(&self.postings(ValueView::ways))
+        self.postings_of(EntityType::Way)
     }
 
     /// Relations carrying this key with any value (`key=*`). See [`Self::nodes`].
     pub fn relations(&self) -> impl Iterator<Item = u64> + 'a {
-        crate::query::union(&self.postings(ValueView::relations))
+        self.postings_of(EntityType::Relation)
     }
 
     /// Nodes carrying this key with any value that fall in `bbox`, ascending.
@@ -192,9 +324,19 @@ impl<'a> KeyView<'a> {
         self.postings_within(EntityType::Relation, &crate::query::to_index_ranges(&idx))
     }
 
-    /// `key=*` for `entity`, ascending (the same merge as [`Self::nodes`]).
+    /// `key=*` for `entity`, ascending: stored postings if present, else the
+    /// merge of this key's value postings.
     pub(crate) fn postings_of(&self, entity: EntityType) -> impl Iterator<Item = u64> + 'a {
-        crate::query::union(&self.postings(value_postings(entity)))
+        let stored = self.stored_postings(entity);
+        let merged = match stored {
+            Some(_) => None,
+            None => Some(crate::query::union(&self.postings(value_postings(entity)))),
+        };
+        stored
+            .into_iter()
+            .flatten()
+            .map(|r| r.value())
+            .chain(merged.into_iter().flatten())
     }
 
     /// `key=*` for `entity`, restricted to the ascending, disjoint `ranges`.
@@ -203,12 +345,28 @@ impl<'a> KeyView<'a> {
         entity: EntityType,
         ranges: &[std::ops::Range<u64>],
     ) -> Vec<u64> {
+        if let Some(stored) = self.stored_postings(entity) {
+            return crate::query::clip_postings(stored, ranges).collect();
+        }
         let clipped = self
             .postings(value_postings(entity))
             .into_iter()
             .map(|postings| crate::query::clip_postings(postings, ranges))
             .collect();
         crate::query::union_iters(clipped).collect()
+    }
+
+    /// This key's precomputed `key=*` postings for `entity`, if the sidecar
+    /// was built with `--key-postings`.
+    fn stored_postings(&self, entity: EntityType) -> Option<&'a [Ref]> {
+        let kp = self.q.taginfo.key_postings()?;
+        let (ranges, posts) = match entity {
+            EntityType::Node => (kp.node_range(), kp.nodes()),
+            EntityType::Way => (kp.way_range(), kp.ways()),
+            EntityType::Relation => (kp.relation_range(), kp.relations()),
+        };
+        let r = ranges.get(self.idx)?.post();
+        posts.get(r.start as usize..r.end as usize)
     }
 
     /// One postings slice per value of this key, for the given entity type.
@@ -311,6 +469,20 @@ impl<'a> ValueView<'a> {
     #[inline]
     pub fn value(&self) -> &'a [u8] {
         self.q.string(self.entry().value_idx())
+    }
+
+    /// This value's index in the `Taginfo.values` vector.
+    #[inline]
+    pub fn index(&self) -> usize {
+        self.idx
+    }
+
+    /// The key this value belongs to (binary search over the keys' value
+    /// ranges, `O(log K)`).
+    pub fn key(&self) -> KeyView<'a> {
+        let keys = self.q.taginfo.keys();
+        let idx = keys.partition_point(|k| k.values().end as usize <= self.idx);
+        KeyView { q: self.q, idx }
     }
 
     /// Per-type counts, derived from postings range lengths (`O(1)`).

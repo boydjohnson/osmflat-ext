@@ -110,6 +110,56 @@ struct TagComboEntry {
     together_count: u64 : 40;
 }
 
+/// Generic 1:n range holder, one per parent entity (or key), parallel to a
+/// parent vector.
+struct Range {
+    @range(post)
+    first_idx: u64 : 40;
+}
+
+/**
+ * Precomputed `key=*` postings: for each key, the entities carrying it with any
+ * value, ascending. Built with `osmflat-extc --key-postings`; without it,
+ * readers derive the same lists by merging the key's value postings.
+ */
+archive KeyPostings {
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `nodes`.
+    node_range: vector< Range >;
+    /// Ascending node indices, grouped by key.
+    nodes: vector< Ref >;
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `ways`.
+    way_range: vector< Range >;
+    /// Ascending way indices, grouped by key.
+    ways: vector< Ref >;
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `relations`.
+    relation_range: vector< Range >;
+    /// Ascending relation indices, grouped by key.
+    relations: vector< Ref >;
+}
+
+/// One distinct trigram and the values containing it.
+struct Trigram {
+    /**
+     * Three bytes of an ASCII-lowercased value string, big-endian
+     * (`b0 << 16 | b1 << 8 | b2`). Non-ASCII bytes are kept as-is.
+     */
+    gram: u32 : 24;
+    /// Range of the values containing this trigram in `ValueSearch.values`.
+    @range(values)
+    value_first_idx: u64 : 40;
+}
+
+/**
+ * Trigram index over distinct value strings, for ASCII case-insensitive
+ * substring search. Built with `osmflat-extc --value-search`.
+ */
+archive ValueSearch {
+    /// Distinct trigrams, ascending by `gram`. Trailing sentinel.
+    trigrams: vector< Trigram >;
+    /// Indices into `Taginfo.values`, ascending within each trigram's range.
+    values: vector< Ref >;
+}
+
 /**
  * Inverted tag index and taginfo histograms.
  */
@@ -140,17 +190,26 @@ archive Taginfo {
      * key/value string. Empty unless built with `osmflat-extc --combinations`.
      */
     tag_combos: vector< TagComboEntry >;
+    /**
+     * Each key's values ordered by total object count (nodes + ways +
+     * relations) descending, then by value string: for key range `[s, e)` in
+     * `values`, `values_by_count[s..e]` holds that range's indices into
+     * `values`, most common first.
+     */
+    values_by_count: vector< Ref >;
+
+    /// Precomputed `key=*` postings (`osmflat-extc --key-postings`).
+    @optional
+    key_postings: archive KeyPostings;
+
+    /// Trigram substring index over value strings (`osmflat-extc --value-search`).
+    @optional
+    value_search: archive ValueSearch;
 }
 
 // ---------------------------------------------------------------------------
 // Backrefs: reverse references (node -> ways, X -> relations)
 // ---------------------------------------------------------------------------
-
-/// Generic 1:n range holder, one per parent entity, parallel to a parent vector.
-struct Range {
-    @range(post)
-    first_idx: u64 : 40;
-}
 
 /**
  * Reverse references. Each `*_range` vector is parallel to a parent entity

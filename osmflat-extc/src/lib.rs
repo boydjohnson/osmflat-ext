@@ -35,6 +35,11 @@ pub struct BuildOptions {
     pub land_polygons: Option<PathBuf>,
     /// Also build taginfo key and tag co-occurrence.
     pub combinations: bool,
+    /// Also build precomputed `key=*` postings (Taginfo `KeyPostings`).
+    pub key_postings: bool,
+    /// Also build the trigram substring index over value strings (Taginfo
+    /// `ValueSearch`).
+    pub value_search: bool,
     /// Directory for mmap-backed postings/offset scratch (planet scale).
     /// `None` keeps every scratch array in RAM (fine for regional extracts);
     /// `Some(dir)` spills them to unlinked temp files under `dir`.
@@ -97,7 +102,7 @@ pub fn build_into(
     let header = osmflat_ext::fingerprint::build_header(parent, builder_idx);
     builder.set_header(&header)?;
 
-    if opts.taginfo || opts.combinations {
+    if opts.taginfo || opts.combinations || opts.key_postings || opts.value_search {
         let taginfo = builder.taginfo()?;
         build_taginfo::build(parent, &taginfo, opts)?;
     }
