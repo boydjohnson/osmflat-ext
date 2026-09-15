@@ -15,12 +15,16 @@ Known limitations:
      scratch, but key-pair counts, each bucket while it is sorted, and the final
      per-tag co-occurrence lists are held in RAM. At planet scale use a machine
      with RAM to match, or skip the flag.
-  4. Only exact and key-prefix lookups are indexed; there is no substring search.
+  4. Substring value search needs --value-search to be fast, folds ASCII case
+     only (non-ASCII bytes must match exactly), and scans every value for
+     patterns shorter than 3 bytes. Keys are exact and prefix searchable only.
   5. No geometry is stored (except --land-polygons, which stores the imported
      coordinates). Spatial queries recompute from the parent.
   6. --coastline only produces closed rings: islands and fully enclosed water.
      A mainland coastline in a bounded extract never closes; use
-     --land-polygons <shapefile> for mainland land fill.";
+     --land-polygons <shapefile> for mainland land fill.
+  7. The sidecar format changes between osmflat-extc versions. A sidecar built
+     by a different version fails to open (schema mismatch); rebuild it.";
 
 /// Build osmflat-ext sidecar archives (inverted tag index / taginfo, reverse
 /// references, precomputed multipolygon / coastline / land-polygon rings)
@@ -69,6 +73,16 @@ struct Args {
     #[arg(long)]
     combinations: bool,
 
+    /// Also store precomputed key=* postings per key, instead of merging a
+    /// key's value postings at query time (implies --taginfo).
+    #[arg(long)]
+    key_postings: bool,
+
+    /// Also build a trigram index for ASCII case-insensitive substring search
+    /// over value strings (implies --taginfo).
+    #[arg(long)]
+    value_search: bool,
+
     /// Back the postings build with mmap temp files here (planet scale).
     #[arg(long)]
     mmap_scratch: Option<PathBuf>,
@@ -84,12 +98,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     let opts = osmflat_extc::BuildOptions {
-        taginfo: args.taginfo || args.combinations,
+        taginfo: args.taginfo || args.combinations || args.key_postings || args.value_search,
         backrefs: args.backrefs,
         multipolygons: args.multipolygons,
         coastline: args.coastline,
         land_polygons: args.land_polygons,
         combinations: args.combinations,
+        key_postings: args.key_postings,
+        value_search: args.value_search,
         mmap_scratch: args.mmap_scratch,
     };
 

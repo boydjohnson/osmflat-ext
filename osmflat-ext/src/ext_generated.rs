@@ -971,7 +971,7 @@ impl TagComboEntry {
         self.set_together_count(other.together_count());
     }
 }
-/// Generic 1:n range holder, one per parent entity, parallel to a parent vector.
+/// parent vector.
 #[repr(transparent)]
 pub struct Range {
     data: [u8; 5],
@@ -1043,6 +1043,99 @@ impl Range {
     #[inline]
     pub fn fill_from(&mut self, other: &Range) {
         self.set_first_idx(other.first_idx());
+    }
+}
+/// One distinct trigram and the values containing it.
+#[repr(transparent)]
+pub struct Trigram {
+    data: [u8; 8],
+}
+
+impl Trigram {
+    /// Unsafe since the struct might not be self-contained
+    pub unsafe fn new_unchecked( ) -> Self {
+        Self{data : [0; 8]}
+    }
+}
+
+impl flatdata::Struct for Trigram {
+    unsafe fn create_unchecked( ) -> Self {
+        Self{data : [0; 8]}
+    }
+
+    const SIZE_IN_BYTES: usize = 8;
+    const IS_OVERLAPPING_WITH_NEXT : bool = true;
+}
+
+impl flatdata::Overlap for Trigram {}
+
+impl Trigram {
+    /// Three bytes of an ASCII-lowercased value string, big-endian
+/// (`b0 << 16 | b1 << 8 | b2`). Non-ASCII bytes are kept as-is.
+    #[inline]
+    pub fn gram(&self) -> u32 {
+        let value = flatdata_read_bytes!(u32, self.data.as_ptr(), 0, 24);
+        unsafe { std::mem::transmute::<u32, u32>(value) }
+    }
+
+    /// First element of the range [`values`].
+    ///
+    /// [`values`]: #method.values
+    #[inline]
+    pub fn value_first_idx(&self) -> u64 {
+        let value = flatdata_read_bytes!(u64, self.data.as_ptr(), 24, 40);
+        unsafe { std::mem::transmute::<u64, u64>(value) }
+    }
+
+    /// Range of the values containing this trigram in `ValueSearch.values`.
+    #[inline]
+    pub fn values(&self) -> std::ops::Range<u64> {
+        let start = flatdata_read_bytes!(u64, self.data.as_ptr(), 24, 40);
+        let end = flatdata_read_bytes!(u64, self.data.as_ptr(), 24 + 8 * 8, 40);
+        start..end
+    }
+
+}
+
+impl std::fmt::Debug for Trigram {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        f.debug_struct("Trigram")
+            .field("gram", &self.gram())
+            .field("value_first_idx", &self.value_first_idx())
+            .finish()
+    }
+}
+
+impl std::cmp::PartialEq for Trigram {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        self.gram() == other.gram() &&        self.value_first_idx() == other.value_first_idx()     }
+}
+
+impl Trigram {
+    /// Three bytes of an ASCII-lowercased value string, big-endian
+/// (`b0 << 16 | b1 << 8 | b2`). Non-ASCII bytes are kept as-is.
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_gram(&mut self, value: u32) {
+        flatdata_write_bytes!(u32; value, self.data, 0, 24)
+    }
+
+    /// First element of the range [`values`].
+    ///
+    /// [`values`]: struct.TrigramRef.html#method.values
+    #[inline]
+    #[allow(missing_docs)]
+    pub fn set_value_first_idx(&mut self, value: u64) {
+        flatdata_write_bytes!(u64; value, self.data, 24, 40)
+    }
+
+
+    /// Copies the data from `other` into this struct.
+    #[inline]
+    pub fn fill_from(&mut self, other: &Trigram) {
+        self.set_gram(other.gram());
+        self.set_value_first_idx(other.value_first_idx());
     }
 }
 /// One assembled coastline ring. Unlike `Multipolygons`, this isn't indexed by
@@ -1378,6 +1471,433 @@ impl LandPolygonRingEntry {
 
 
 
+/// Precomputed `key=*` postings: for each key, the entities carrying it with any
+/// value, ascending. Built with `osmflat-extc --key-postings`; without it,
+/// readers derive the same lists by merging the key's value postings.
+#[derive(Clone)]
+pub struct KeyPostings {
+    _storage: flatdata::StorageHandle,
+    node_range : &'static [super::osm_ext::Range],
+    nodes : &'static [super::osm_ext::Ref],
+    way_range : &'static [super::osm_ext::Range],
+    ways : &'static [super::osm_ext::Ref],
+    relation_range : &'static [super::osm_ext::Range],
+    relations : &'static [super::osm_ext::Ref],
+}
+
+impl KeyPostings {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `nodes`.
+    #[inline]
+    pub fn node_range(&self) -> &[super::osm_ext::Range] {
+        self.node_range
+    }
+
+    /// Ascending node indices, grouped by key.
+    #[inline]
+    pub fn nodes(&self) -> &[super::osm_ext::Ref] {
+        self.nodes
+    }
+
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `ways`.
+    #[inline]
+    pub fn way_range(&self) -> &[super::osm_ext::Range] {
+        self.way_range
+    }
+
+    /// Ascending way indices, grouped by key.
+    #[inline]
+    pub fn ways(&self) -> &[super::osm_ext::Ref] {
+        self.ways
+    }
+
+    /// Parallel to `Taginfo.keys` (plus a trailing sentinel); slices `relations`.
+    #[inline]
+    pub fn relation_range(&self) -> &[super::osm_ext::Range] {
+        self.relation_range
+    }
+
+    /// Ascending relation indices, grouped by key.
+    #[inline]
+    pub fn relations(&self) -> &[super::osm_ext::Ref] {
+        self.relations
+    }
+
+}
+
+impl ::std::fmt::Debug for KeyPostings {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("KeyPostings")
+            .field("node_range", &self.node_range())
+            .field("nodes", &self.nodes())
+            .field("way_range", &self.way_range())
+            .field("ways", &self.ways())
+            .field("relation_range", &self.relation_range())
+            .field("relations", &self.relations())
+            .finish()
+    }
+}
+
+impl KeyPostings {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("KeyPostings"), schema::key_postings::KEY_POSTINGS)?;
+
+        let node_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("node_range", schema::key_postings::resources::NODE_RANGE));
+            check("node_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let nodes = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("nodes", schema::key_postings::resources::NODES));
+            check("nodes", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+        let way_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("way_range", schema::key_postings::resources::WAY_RANGE));
+            check("way_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let ways = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("ways", schema::key_postings::resources::WAYS));
+            check("ways", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+        let relation_range = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("relation_range", schema::key_postings::resources::RELATION_RANGE));
+            check("relation_range", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Range]>::from_bytes(x)))?
+        };
+        let relations = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("relations", schema::key_postings::resources::RELATIONS));
+            check("relations", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            node_range,
+            nodes,
+            way_range,
+            ways,
+            relation_range,
+            relations,
+        })
+    }
+}
+
+/// Builder for creating [`KeyPostings`] archives.
+///
+///[`KeyPostings`]: struct.KeyPostings.html
+#[derive(Clone, Debug)]
+pub struct KeyPostingsBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl KeyPostingsBuilder {
+    #[inline]
+    /// Stores [`node_range`] in the archive.
+    ///
+    /// [`node_range`]: struct.KeyPostings.html#method.node_range
+    pub fn set_node_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("node_range", schema::key_postings::resources::NODE_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`node_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`node_range`]: struct.KeyPostings.html#method.node_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_node_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "node_range", schema::key_postings::resources::NODE_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`nodes`] in the archive.
+    ///
+    /// [`nodes`]: struct.KeyPostings.html#method.nodes
+    pub fn set_nodes(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("nodes", schema::key_postings::resources::NODES, vector.as_bytes())
+    }
+
+    /// Opens [`nodes`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`nodes`]: struct.KeyPostings.html#method.nodes
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_nodes(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "nodes", schema::key_postings::resources::NODES)
+    }
+
+    #[inline]
+    /// Stores [`way_range`] in the archive.
+    ///
+    /// [`way_range`]: struct.KeyPostings.html#method.way_range
+    pub fn set_way_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("way_range", schema::key_postings::resources::WAY_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`way_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`way_range`]: struct.KeyPostings.html#method.way_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_way_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "way_range", schema::key_postings::resources::WAY_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`ways`] in the archive.
+    ///
+    /// [`ways`]: struct.KeyPostings.html#method.ways
+    pub fn set_ways(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("ways", schema::key_postings::resources::WAYS, vector.as_bytes())
+    }
+
+    /// Opens [`ways`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`ways`]: struct.KeyPostings.html#method.ways
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_ways(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "ways", schema::key_postings::resources::WAYS)
+    }
+
+    #[inline]
+    /// Stores [`relation_range`] in the archive.
+    ///
+    /// [`relation_range`]: struct.KeyPostings.html#method.relation_range
+    pub fn set_relation_range(&self, vector: &[super::osm_ext::Range]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("relation_range", schema::key_postings::resources::RELATION_RANGE, vector.as_bytes())
+    }
+
+    /// Opens [`relation_range`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`relation_range`]: struct.KeyPostings.html#method.relation_range
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_relation_range(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Range>> {
+        flatdata::create_external_vector(&*self.storage, "relation_range", schema::key_postings::resources::RELATION_RANGE)
+    }
+
+    #[inline]
+    /// Stores [`relations`] in the archive.
+    ///
+    /// [`relations`]: struct.KeyPostings.html#method.relations
+    pub fn set_relations(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("relations", schema::key_postings::resources::RELATIONS, vector.as_bytes())
+    }
+
+    /// Opens [`relations`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`relations`]: struct.KeyPostings.html#method.relations
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_relations(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "relations", schema::key_postings::resources::RELATIONS)
+    }
+
+}
+
+impl KeyPostingsBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("KeyPostings", schema::key_postings::KEY_POSTINGS, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
+
+
+
+/// Trigram index over distinct value strings, for ASCII case-insensitive
+/// substring search. Built with `osmflat-extc --value-search`.
+#[derive(Clone)]
+pub struct ValueSearch {
+    _storage: flatdata::StorageHandle,
+    trigrams : &'static [super::osm_ext::Trigram],
+    values : &'static [super::osm_ext::Ref],
+}
+
+impl ValueSearch {
+    fn signature_name(archive_name: &str) -> String {
+        format!("{}.archive", archive_name)
+    }
+
+    /// Distinct trigrams, ascending by `gram`. Trailing sentinel.
+    #[inline]
+    pub fn trigrams(&self) -> &[super::osm_ext::Trigram] {
+        self.trigrams
+    }
+
+    /// Indices into `Taginfo.values`, ascending within each trigram's range.
+    #[inline]
+    pub fn values(&self) -> &[super::osm_ext::Ref] {
+        self.values
+    }
+
+}
+
+impl ::std::fmt::Debug for ValueSearch {
+    fn fmt(&self, f: &mut ::std::fmt::Formatter) -> ::std::fmt::Result {
+        f.debug_struct("ValueSearch")
+            .field("trigrams", &self.trigrams())
+            .field("values", &self.values())
+            .finish()
+    }
+}
+
+impl ValueSearch {
+    pub fn open(storage: flatdata::StorageHandle)
+        -> ::std::result::Result<Self, flatdata::ResourceStorageError>
+    {
+        #[allow(unused_imports)]
+        use flatdata::SliceExt;
+        #[allow(unused_variables)]
+        use flatdata::ResourceStorageError as Error;
+        // extend lifetime since Rust cannot know that we reference a cache here
+        #[allow(unused_variables)]
+        let extend = |x : Result<&[u8], Error>| -> Result<&'static [u8], Error> {x.map(|x| unsafe{std::mem::transmute(x)})};
+
+        storage.read(&Self::signature_name("ValueSearch"), schema::value_search::VALUE_SEARCH)?;
+
+        let trigrams = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("trigrams", schema::value_search::resources::TRIGRAMS));
+            check("trigrams", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Trigram]>::from_bytes(x)))?
+        };
+        let values = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("values", schema::value_search::resources::VALUES));
+            check("values", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+
+        Ok(Self {
+            _storage: storage,
+            trigrams,
+            values,
+        })
+    }
+}
+
+/// Builder for creating [`ValueSearch`] archives.
+///
+///[`ValueSearch`]: struct.ValueSearch.html
+#[derive(Clone, Debug)]
+pub struct ValueSearchBuilder {
+    storage: flatdata::StorageHandle
+}
+
+impl ValueSearchBuilder {
+    #[inline]
+    /// Stores [`trigrams`] in the archive.
+    ///
+    /// [`trigrams`]: struct.ValueSearch.html#method.trigrams
+    pub fn set_trigrams(&self, vector: &[super::osm_ext::Trigram]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("trigrams", schema::value_search::resources::TRIGRAMS, vector.as_bytes())
+    }
+
+    /// Opens [`trigrams`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`trigrams`]: struct.ValueSearch.html#method.trigrams
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_trigrams(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Trigram>> {
+        flatdata::create_external_vector(&*self.storage, "trigrams", schema::value_search::resources::TRIGRAMS)
+    }
+
+    #[inline]
+    /// Stores [`values`] in the archive.
+    ///
+    /// [`values`]: struct.ValueSearch.html#method.values
+    pub fn set_values(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("values", schema::value_search::resources::VALUES, vector.as_bytes())
+    }
+
+    /// Opens [`values`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`values`]: struct.ValueSearch.html#method.values
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_values(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "values", schema::value_search::resources::VALUES)
+    }
+
+}
+
+impl ValueSearchBuilder {
+    pub fn new(
+        storage: flatdata::StorageHandle,
+    ) -> Result<Self, flatdata::ResourceStorageError> {
+        flatdata::create_archive("ValueSearch", schema::value_search::VALUE_SEARCH, &storage)?;
+        Ok(Self { storage })
+    }
+}
+
+
+
+
 /// Inverted tag index and taginfo histograms.
 #[derive(Clone)]
 pub struct Taginfo {
@@ -1389,6 +1909,11 @@ pub struct Taginfo {
     rel_post : &'static [super::osm_ext::Ref],
     combos : &'static [super::osm_ext::ComboEntry],
     tag_combos : &'static [super::osm_ext::TagComboEntry],
+    values_by_count : &'static [super::osm_ext::Ref],
+    key_postings : Option<super::osm_ext::KeyPostings
+>,
+    value_search : Option<super::osm_ext::ValueSearch
+>,
 }
 
 impl Taginfo {
@@ -1442,6 +1967,27 @@ impl Taginfo {
         self.tag_combos
     }
 
+    /// Each key's values ordered by total object count (nodes + ways +
+/// relations) descending, then by value string: for key range `[s, e)` in
+/// `values`, `values_by_count[s..e]` holds that range's indices into
+/// `values`, most common first.
+    #[inline]
+    pub fn values_by_count(&self) -> &[super::osm_ext::Ref] {
+        self.values_by_count
+    }
+
+    /// Precomputed `key=*` postings (`osmflat-extc --key-postings`).
+    #[inline]
+    pub fn key_postings(&self) -> Option<&super::osm_ext::KeyPostings> {
+        self.key_postings.as_ref()
+    }
+
+    /// Trigram substring index over value strings (`osmflat-extc --value-search`).
+    #[inline]
+    pub fn value_search(&self) -> Option<&super::osm_ext::ValueSearch> {
+        self.value_search.as_ref()
+    }
+
 }
 
 impl ::std::fmt::Debug for Taginfo {
@@ -1454,6 +2000,9 @@ impl ::std::fmt::Debug for Taginfo {
             .field("rel_post", &self.rel_post())
             .field("combos", &self.combos())
             .field("tag_combos", &self.tag_combos())
+            .field("values_by_count", &self.values_by_count())
+            .field("key_postings", &self.key_postings())
+            .field("value_search", &self.value_search())
             .finish()
     }
 }
@@ -1514,6 +2063,22 @@ impl Taginfo {
             let resource = extend(storage.read("tag_combos", schema::taginfo::resources::TAG_COMBOS));
             check("tag_combos", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::TagComboEntry]>::from_bytes(x)))?
         };
+        let values_by_count = {
+            use flatdata::check_resource as check;
+            let max_size = None;
+            let resource = extend(storage.read("values_by_count", schema::taginfo::resources::VALUES_BY_COUNT));
+            check("values_by_count", |r| r.len(), max_size, resource.and_then(|x| <&[super::osm_ext::Ref]>::from_bytes(x)))?
+        };
+        let key_postings = {
+            use flatdata::check_optional_resource as check;
+            let max_size = None;
+            check("key_postings", |_| 0, max_size, super::osm_ext::KeyPostings::open(storage.subdir("key_postings")))?
+        };
+        let value_search = {
+            use flatdata::check_optional_resource as check;
+            let max_size = None;
+            check("value_search", |_| 0, max_size, super::osm_ext::ValueSearch::open(storage.subdir("value_search")))?
+        };
 
         Ok(Self {
             _storage: storage,
@@ -1524,6 +2089,9 @@ impl Taginfo {
             rel_post,
             combos,
             tag_combos,
+            values_by_count,
+            key_postings,
+            value_search,
         })
     }
 }
@@ -1689,6 +2257,46 @@ impl TaginfoBuilder {
     #[inline]
     pub fn start_tag_combos(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::TagComboEntry>> {
         flatdata::create_external_vector(&*self.storage, "tag_combos", schema::taginfo::resources::TAG_COMBOS)
+    }
+
+    #[inline]
+    /// Stores [`values_by_count`] in the archive.
+    ///
+    /// [`values_by_count`]: struct.Taginfo.html#method.values_by_count
+    pub fn set_values_by_count(&self, vector: &[super::osm_ext::Ref]) -> ::std::io::Result<()> {
+        use flatdata::SliceExt;
+        self.storage.write("values_by_count", schema::taginfo::resources::VALUES_BY_COUNT, vector.as_bytes())
+    }
+
+    /// Opens [`values_by_count`] in the archive for buffered writing.
+    ///
+    /// Elements can be added to the vector until the [`ExternalVector::close`] method
+    /// is called. To flush the data fully into the archive, this method must be called
+    /// in the end.
+    ///
+    /// [`values_by_count`]: struct.Taginfo.html#method.values_by_count
+    /// [`ExternalVector::close`]: flatdata/struct.ExternalVector.html#method.close
+    #[inline]
+    pub fn start_values_by_count(&self) -> ::std::io::Result<flatdata::ExternalVector<super::osm_ext::Ref>> {
+        flatdata::create_external_vector(&*self.storage, "values_by_count", schema::taginfo::resources::VALUES_BY_COUNT)
+    }
+
+    /// Stores [`key_postings`] in the archive.
+    ///
+    /// [`key_postings`]: struct.Taginfo.html#method.key_postings
+    #[inline]
+    pub fn key_postings(&self) -> Result<super::osm_ext::KeyPostingsBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("key_postings");
+        super::osm_ext::KeyPostingsBuilder::new(storage)
+    }
+
+    /// Stores [`value_search`] in the archive.
+    ///
+    /// [`value_search`]: struct.Taginfo.html#method.value_search
+    #[inline]
+    pub fn value_search(&self) -> Result<super::osm_ext::ValueSearchBuilder, flatdata::ResourceStorageError> {
+        let storage = self.storage.subdir("value_search");
+        super::osm_ext::ValueSearchBuilder::new(storage)
     }
 
 }
@@ -2839,6 +3447,204 @@ impl ExtBuilder {
 
 #[doc(hidden)]
 pub mod schema {
+pub mod key_postings {
+
+pub const KEY_POSTINGS: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+    way_range : vector< .osm_ext.Range >;
+    ways : vector< .osm_ext.Ref >;
+    relation_range : vector< .osm_ext.Range >;
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const NODE_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const NODES: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    nodes : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+pub const WAY_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    way_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const WAYS: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    ways : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+pub const RELATION_RANGE: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    relation_range : vector< .osm_ext.Range >;
+}
+}
+
+"#;
+pub const RELATIONS: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+}
+}
+pub mod value_search {
+
+pub const VALUE_SEARCH: &str = r#"namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+    values : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+
+pub mod resources {
+pub const TRIGRAMS: &str = r#"namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+}
+}
+
+"#;
+pub const VALUES: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    values : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+}
+}
 pub mod taginfo {
 
 pub const TAGINFO: &str = r#"namespace osm_ext {
@@ -2895,7 +3701,44 @@ struct TagComboEntry
 }
 
 namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+    way_range : vector< .osm_ext.Range >;
+    ways : vector< .osm_ext.Ref >;
+    relation_range : vector< .osm_ext.Range >;
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+    values : vector< .osm_ext.Ref >;
+}
 }
 
 namespace osm_ext {
@@ -2908,6 +3751,11 @@ archive Taginfo
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
     tag_combos : vector< .osm_ext.TagComboEntry >;
+    values_by_count : vector< .osm_ext.Ref >;
+    @optional
+    key_postings : archive .osm_ext.KeyPostings;
+    @optional
+    value_search : archive .osm_ext.ValueSearch;
 }
 }
 
@@ -3033,6 +3881,98 @@ namespace osm_ext {
 archive Taginfo
 {
     tag_combos : vector< .osm_ext.TagComboEntry >;
+}
+}
+
+"#;
+pub const VALUES_BY_COUNT: &str = r#"namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive Taginfo
+{
+    values_by_count : vector< .osm_ext.Ref >;
+}
+}
+
+"#;
+pub const KEY_POSTINGS: &str = r#"namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+    way_range : vector< .osm_ext.Range >;
+    ways : vector< .osm_ext.Ref >;
+    relation_range : vector< .osm_ext.Range >;
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+archive Taginfo
+{
+    @optional
+    key_postings : archive .osm_ext.KeyPostings;
+}
+}
+
+"#;
+pub const VALUE_SEARCH: &str = r#"namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+struct Ref
+{
+    value : u64 : 40;
+}
+}
+
+namespace osm_ext {
+const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+    values : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+archive Taginfo
+{
+    @optional
+    value_search : archive .osm_ext.ValueSearch;
 }
 }
 
@@ -3508,7 +4448,44 @@ struct TagComboEntry
 }
 
 namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+    way_range : vector< .osm_ext.Range >;
+    ways : vector< .osm_ext.Ref >;
+    relation_range : vector< .osm_ext.Range >;
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+    values : vector< .osm_ext.Ref >;
+}
 }
 
 namespace osm_ext {
@@ -3521,14 +4498,11 @@ archive Taginfo
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
     tag_combos : vector< .osm_ext.TagComboEntry >;
-}
-}
-
-namespace osm_ext {
-struct Range
-{
-    @range( post )
-    first_idx : u64 : 40;
+    values_by_count : vector< .osm_ext.Ref >;
+    @optional
+    key_postings : archive .osm_ext.KeyPostings;
+    @optional
+    value_search : archive .osm_ext.ValueSearch;
 }
 }
 
@@ -3705,7 +4679,44 @@ struct TagComboEntry
 }
 
 namespace osm_ext {
+struct Range
+{
+    @range( post )
+    first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
 const u64 INVALID_IDX = 1099511627775;
+}
+
+namespace osm_ext {
+archive KeyPostings
+{
+    node_range : vector< .osm_ext.Range >;
+    nodes : vector< .osm_ext.Ref >;
+    way_range : vector< .osm_ext.Range >;
+    ways : vector< .osm_ext.Ref >;
+    relation_range : vector< .osm_ext.Range >;
+    relations : vector< .osm_ext.Ref >;
+}
+}
+
+namespace osm_ext {
+struct Trigram
+{
+    gram : u32 : 24;
+    @range( values )
+    value_first_idx : u64 : 40;
+}
+}
+
+namespace osm_ext {
+archive ValueSearch
+{
+    trigrams : vector< .osm_ext.Trigram >;
+    values : vector< .osm_ext.Ref >;
+}
 }
 
 namespace osm_ext {
@@ -3718,6 +4729,11 @@ archive Taginfo
     rel_post : vector< .osm_ext.Ref >;
     combos : vector< .osm_ext.ComboEntry >;
     tag_combos : vector< .osm_ext.TagComboEntry >;
+    values_by_count : vector< .osm_ext.Ref >;
+    @optional
+    key_postings : archive .osm_ext.KeyPostings;
+    @optional
+    value_search : archive .osm_ext.ValueSearch;
 }
 }
 

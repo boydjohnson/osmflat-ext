@@ -99,6 +99,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(taginfo) = archive.ext().taginfo() {
         println!("=== taginfo ===");
         checks.extend(verify_taginfo(parent, taginfo, args.sample));
+        checks.extend(verify_taginfo_extras(parent, taginfo));
     } else {
         println!("(no taginfo sub-archive — skipping)");
     }
@@ -581,6 +582,178 @@ fn verify_taginfo(parent: &Osm, taginfo: &Taginfo, sample_target: usize) -> Vec<
         c_total_posts,
         c_ground_truth,
     ]
+}
+
+/// Checks `values_by_count`, and the optional `KeyPostings` and `ValueSearch`
+/// sub-archives when present.
+fn verify_taginfo_extras(parent: &Osm, taginfo: &Taginfo) -> Vec<Check> {
+    let keys = taginfo.keys();
+    let values = taginfo.values();
+    let strtab = parent.stringtable();
+    let total = |i: usize| {
+        let v = &values[i];
+        let len = |r: std::ops::Range<u64>| r.end - r.start;
+        len(v.node_post()) + len(v.way_post()) + len(v.rel_post())
+    };
+    let mut checks = Vec::new();
+
+    // values_by_count: per key, a permutation of its value range, ordered by
+    // total count descending then value index (= value string) ascending.
+    let mut c_len = Check::new("values_by_count has one entry per value");
+    let mut c_perm = Check::new("values_by_count is a permutation of each key's values");
+    let mut c_order = Check::new("values_by_count ordered by (count desc, value string)");
+    let by_count = taginfo.values_by_count();
+    if by_count.len() != values.len() {
+        c_len.fail(format!(
+            "{} entries, {} values",
+            by_count.len(),
+            values.len()
+        ));
+    } else {
+        for (k, key) in keys.iter().enumerate() {
+            let r = key.values();
+            let slice = &by_count[r.start as usize..r.end as usize];
+            let mut seen: Vec<u64> = slice.iter().map(|v| v.value()).collect();
+            seen.sort_unstable();
+            if !seen.iter().copied().eq(r.clone()) {
+                c_perm.fail(format!(
+                    "key #{k}: not a permutation of {}..{}",
+                    r.start, r.end
+                ));
+                continue;
+            }
+            for w in slice.windows(2) {
+                let (a, b) = (w[0].value() as usize, w[1].value() as usize);
+                if (total(a), std::cmp::Reverse(a)) < (total(b), std::cmp::Reverse(b)) {
+                    c_order.fail(format!("key #{k}: value {a} before {b}"));
+                }
+            }
+        }
+    }
+    checks.extend([c_len, c_perm, c_order]);
+
+    if let Some(kp) = taginfo.key_postings() {
+        println!("  (key postings present)");
+        let mut c_lengths = Check::new("key postings: one range entry per key");
+        let mut c_contig = Check::new("key postings: ranges contiguous");
+        let mut c_bounds = Check::new("key postings: indices within parent bounds");
+        let mut c_ascending = Check::new("key postings: strictly ascending per key");
+        let mut c_counts = Check::new("key postings: lengths equal KeyEntry counts");
+        let types = [
+            (
+                kp.node_range(),
+                kp.nodes(),
+                parent.nodes().len() as u64,
+                "nodes",
+            ),
+            (
+                kp.way_range(),
+                kp.ways(),
+                parent.ways().len() as u64,
+                "ways",
+            ),
+            (
+                kp.relation_range(),
+                kp.relations(),
+                parent.relations().len() as u64,
+                "relations",
+            ),
+        ];
+        for (ty, (ranges, posts, n_targets, label)) in types.into_iter().enumerate() {
+            check_range_array(
+                ranges,
+                posts,
+                keys.len(),
+                n_targets,
+                label,
+                &mut c_lengths,
+                &mut c_contig,
+                &mut c_bounds,
+                &mut c_ascending,
+            );
+            for (k, (key, range)) in keys.iter().zip(ranges).enumerate() {
+                let want = [key.count_nodes(), key.count_ways(), key.count_relations()][ty];
+                let got = range.post().end - range.post().start;
+                if got != want {
+                    c_counts.fail(format!("key #{k} {label}: {got} postings, count {want}"));
+                }
+            }
+        }
+        checks.extend([c_lengths, c_contig, c_bounds, c_ascending, c_counts]);
+    } else {
+        println!("  (no key postings — skipping)");
+    }
+
+    if let Some(search) = taginfo.value_search() {
+        println!("  (value search present)");
+        let mut c_grams = Check::new("value search: trigrams strictly ascending");
+        let mut c_runs = Check::new("value search: runs contiguous, ascending, in bounds");
+        let mut c_total = Check::new("value search: postings equal distinct trigrams per value");
+        let mut c_contains = Check::new("value search: every posting's value contains its trigram");
+        let (trigrams, postings) = (search.trigrams(), search.values());
+
+        let mut next = 0u64;
+        for (i, t) in trigrams.iter().enumerate() {
+            if i > 0 && trigrams[i - 1].gram() >= t.gram() {
+                c_grams.fail(format!(
+                    "trigram #{i}: {:#08x} after {:#08x}",
+                    t.gram(),
+                    trigrams[i - 1].gram()
+                ));
+            }
+            let r = t.values();
+            if r.start != next || r.end < r.start || r.end as usize > postings.len() {
+                c_runs.fail(format!(
+                    "trigram #{i}: range {}..{}, expected start {next}",
+                    r.start, r.end
+                ));
+                continue;
+            }
+            next = r.end;
+            let run = &postings[r.start as usize..r.end as usize];
+            let gram = [
+                (t.gram() >> 16) as u8,
+                (t.gram() >> 8) as u8,
+                t.gram() as u8,
+            ];
+            for (j, p) in run.iter().enumerate() {
+                let v = p.value();
+                if v as usize >= values.len() || (j > 0 && run[j - 1].value() >= v) {
+                    c_runs.fail(format!("trigram #{i}: bad posting {v}"));
+                    continue;
+                }
+                let value = strtab.substring_raw(values[v as usize].value_idx() as usize);
+                if !value.windows(3).any(|w| w.to_ascii_lowercase() == gram) {
+                    c_contains.fail(format!("trigram #{i} {gram:?}: value {v} lacks it"));
+                }
+            }
+        }
+        if next != postings.len() as u64 {
+            c_runs.fail(format!(
+                "coverage ends at {next}, postings len {}",
+                postings.len()
+            ));
+        }
+        let mut grams = Vec::new();
+        let expected: u64 = values
+            .iter()
+            .map(|v| {
+                let value = strtab.substring_raw(v.value_idx() as usize);
+                osmflat_ext::taginfo::value_trigrams(value, &mut grams);
+                grams.len() as u64
+            })
+            .sum();
+        if expected != postings.len() as u64 {
+            c_total.fail(format!(
+                "{} postings, values have {expected} distinct trigrams",
+                postings.len()
+            ));
+        }
+        checks.extend([c_grams, c_runs, c_total, c_contains]);
+    } else {
+        println!("  (no value search — skipping)");
+    }
+    checks
 }
 
 /// Checks one `(ranges, posts)` CSR pair: `ranges` has one entry per parent

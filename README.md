@@ -60,6 +60,11 @@ cargo run --example taginfo  -- district-of-columbia.osmflat dc-combos.ext highw
 cargo run --example taginfo  -- district-of-columbia.osmflat dc.ext highway crossing
 cargo run --example taginfo  -- district-of-columbia.osmflat dc-combos.ext highway crossing --combinations
 
+# substring value search, across all keys or one key (fast with --value-search)
+osmflat-extc --taginfo --value-search --out dc-search.ext district-of-columbia.osmflat
+cargo run --example taginfo  -- district-of-columbia.osmflat dc-search.ext --search capitol
+cargo run --example taginfo  -- district-of-columbia.osmflat dc-search.ext name --search capitol
+
 # reverse references (OSM-id lookup needs the parent built with --reverse-ids)
 cargo run --example backrefs -- district-of-columbia.osmflat dc.ext node 281072
 cargo run --example backrefs -- district-of-columbia.osmflat dc.ext way 535462113
@@ -230,7 +235,15 @@ $ cargo run --release --example spatial -- us.osm.flat --limit 5 polygon -77.04 
   segment of a way, or any member (recursively) of a relation.
 - `KeyView::{nodes,ways,relations}` give `key=*` (any value), and
   `KeyView::{nodes,ways,relations}_in_bbox` clip it to a bbox without scanning
-  every posting of a large key.
+  every posting of a large key. `osmflat-extc --key-postings` stores each key's
+  `key=*` lists at build time; the same methods (and `Query::with_key`) read
+  them directly when present and merge the value postings otherwise.
+- `KeyView::values_by_count` lists a key's values most common first (always
+  built with `--taginfo`), so taginfo's "top values" needs no sort.
+- `TaginfoQuery::values_containing` and `KeyView::values_containing` find
+  values containing a substring, ASCII case-insensitively (`"lake"` matches
+  `"Lake Harriet"`). `osmflat-extc --value-search` builds a trigram index for
+  it; without the index, or for patterns under 3 bytes, every value is scanned.
 - `ExtArchive::query()` composes tag and spatial constraints into one query,
   resolved to ascending parent indices:
 
@@ -335,6 +348,11 @@ cargo build --workspace --examples --all-features
 ```
 
 ## Current Limitation
+
+The sidecar format is tied to the `osmflat-extc` version. flatdata checks each
+archive's stored schema exactly on open, so a sidecar built by an earlier
+version (before `values_by_count`, `--key-postings`, and `--value-search` were
+added, for example) fails to open. Rebuild it with the current `osmflat-extc`.
 
 `--combinations` is only partly backed by `--mmap-scratch`. The raw tag-pair
 mentions are written to scratch in sequential buckets, but the key-pair counts,

@@ -20,6 +20,11 @@
 //! # one key=value: counts by type and a few example OSM ids
 //! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway primary
 //! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext highway primary --combinations
+//!
+//! # values containing a substring (ASCII case-insensitive), across all keys or
+//! # one key; fast with a sidecar built with --value-search, a scan otherwise
+//! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext --search harriet
+//! cargo run --example taginfo -- planet.osm.flatdata planet.osm.ext name --search harriet
 //! ```
 //!
 //! LICENSE: the code in this example file is released into the Public Domain.
@@ -46,6 +51,10 @@ struct Args {
     /// Requires building the sidecar with `osmflat-extc --combinations`.
     #[arg(long)]
     combinations: bool,
+    /// List values containing this substring (ASCII case-insensitive), within
+    /// `key` if given, most common first.
+    #[arg(long)]
+    search: Option<String>,
     /// How many rows to print.
     #[arg(long, default_value_t = 20)]
     top: usize,
@@ -68,6 +77,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let tq = archive
         .taginfo()
         .ok_or("sidecar has no taginfo sub-archive (rebuild with --taginfo)")?;
+
+    if let Some(pattern) = args.search.as_deref() {
+        return search_values(&tq, args.key.as_deref(), pattern, args.top);
+    }
 
     match (
         args.key.as_deref(),
@@ -122,25 +135,64 @@ fn show_key(tq: &TaginfoQuery, key: &str, top: usize) -> Result<(), Box<dyn std:
         k.distinct_values(),
     );
 
-    let mut values: Vec<_> = k
-        .values()
-        .map(|v| (v.value().to_vec(), v.counts()))
-        .collect();
-    values.sort_by_key(|(_, c)| std::cmp::Reverse(total(*c)));
-
     println!(
         "{:<28} {:>12} {:>10} {:>10} {:>9}",
         "value", "objects", "nodes", "ways", "rels"
     );
-    for (value, c) in values.into_iter().take(top) {
+    // Stored most-common-first, so no sort over a key's (possibly millions of)
+    // values.
+    for v in k.values_by_count().take(top) {
+        let c = v.counts();
         println!(
             "{:<28} {:>12} {:>10} {:>10} {:>9}",
-            s(&value),
+            s(v.value()),
             total(c),
             c.nodes,
             c.ways,
             c.relations,
         );
+    }
+    Ok(())
+}
+
+/// Values containing `pattern`, across all keys or within `key`.
+fn search_values(
+    tq: &TaginfoQuery,
+    key: Option<&str>,
+    pattern: &str,
+    top: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let start = std::time::Instant::now();
+    let mut hits = match key {
+        Some(key) => tq
+            .key(key.as_bytes())
+            .ok_or_else(|| format!("key {key:?} not found"))?
+            .values_containing(pattern.as_bytes()),
+        None => tq.values_containing(pattern.as_bytes()),
+    };
+    let elapsed = start.elapsed();
+    hits.sort_by_key(|v| std::cmp::Reverse(total(v.counts())));
+
+    println!(
+        "{} value(s) containing {pattern:?} in {elapsed:?} ({})\n",
+        hits.len(),
+        if tq.has_value_search() {
+            "trigram index"
+        } else {
+            "scan; build with --value-search to index"
+        }
+    );
+    println!("{:<24} {:<36} {:>12}", "key", "value", "objects");
+    for v in hits.iter().take(top) {
+        println!(
+            "{:<24} {:<36} {:>12}",
+            s(v.key().key()),
+            s(v.value()),
+            total(v.counts())
+        );
+    }
+    if hits.len() > top {
+        println!("… (+{})", hits.len() - top);
     }
     Ok(())
 }
