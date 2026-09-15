@@ -36,6 +36,16 @@ cheap, and ship a query library that uses them:
 5. **OSM id → entity** — already provided by `Ids.*_by_id`; the query layer
    just exposes the binary search. Not re-implemented here.
 
+Added as the project grew:
+
+6. **Substring value search** — find values containing a string, ASCII
+   case-insensitively, via a trigram index (§4).
+7. **Combined queries** — tags, `key=*`, and spatial constraints in one query,
+   resolved by merge-joins over ascending index runs (§7).
+8. **Rendering geometry** — precomputed multipolygon rings, coastline rings,
+   and imported land polygons, so renderers don't re-assemble rings per query
+   (§5a).
+
 **Non-goals.**
 - Not a re-import. The compiler reads the finished `Osm` archive (mmap), never
   the source `.osm.pbf`.
@@ -169,6 +179,8 @@ struct KeyEntry {
     count_relations: u64 : 40;
     /// Distinct values for this key.
     @range(values) value_first_idx: u64 : 40;
+    /// Co-occurring keys (empty without --combinations; see below).
+    @range(combos) combo_first_idx: u64 : 40;
 }
 
 struct ValueEntry {
@@ -179,6 +191,8 @@ struct ValueEntry {
     @range(node_post) node_first_idx: u64 : 40;
     @range(way_post)  way_first_idx:  u64 : 40;
     @range(rel_post)  rel_first_idx:  u64 : 40;
+    /// Co-occurring tags (empty without --combinations).
+    @range(tag_combos) tag_combo_first_idx: u64 : 40;
 }
 
 /// Index into the parent nodes / ways / relations vector. Ascending within a
@@ -195,6 +209,15 @@ archive Taginfo {
     node_post: vector<Ref>;
     way_post:  vector<Ref>;
     rel_post:  vector<Ref>;
+    /// Co-occurrence tables (below).
+    combos:     vector<ComboEntry>;
+    tag_combos: vector<TagComboEntry>;
+    /// Each key's values by count (below).
+    values_by_count: vector<Ref>;
+    /// Stored key=* postings (below).
+    @optional key_postings: archive KeyPostings;
+    /// Trigram substring index (below).
+    @optional value_search: archive ValueSearch;
     /// builder_idx etc. — handled by Ext.header; no strings needed here.
 }
 ```
@@ -369,7 +392,7 @@ built from the finished parent.
 |---|---|---|---|
 | `Multipolygons` | `--multipolygons` | each `type=multipolygon`/`type=boundary` relation's outer/inner ways stitched into closed rings, once, at build time; relation → polygons → rings → nodes | parent node indices |
 | `Coastline` | `--coastline` | every `natural=coastline` way stitched into closed rings, classified land/water by winding ("land on the left"), sorted by area descending | parent node indices |
-| `LandPolygons` | `--land-polygons <shapefile>` | rings imported from an external, already-closed dataset (osmdata.openstreetmap.de `land-polygons`, EPSG:3857 reprojected to WGS84), clipped to the parent's bbox, sorted by area descending | raw scaled coordinates |
+| `LandPolygons` | `--land-polygons <shapefile>` | rings imported from an external, already-closed dataset (osmdata.openstreetmap.de `land-polygons`, EPSG:3857 reprojected to WGS84); rings kept whole when their bbox overlaps the parent's; land/hole from the shapefile's ring role; sorted by area descending | raw scaled coordinates |
 
 Sorting rings by area descending lets a renderer paint largest-first and get
 arbitrarily deep nesting (island in a bay in a sea) right with no explicit
@@ -380,6 +403,13 @@ external rings have no correspondence to parent nodes. It exists because
 `--coastline` alone can only close islands and enclosed lakes — a mainland
 coastline in any bounded extract is an open chain that never closes into a
 ring.
+
+The two ring classifications deliberately differ. `Coastline` derives land vs.
+water from signed area, because `natural=coastline` puts land on the left of
+the way's direction. `LandPolygons` takes it from the shapefile's own `Outer` /
+`Inner` ring role instead: the `shapefile` crate canonicalizes winding to the
+ESRI convention (outer rings clockwise), the opposite sense, so reusing the
+signed-area check would turn every landmass into a hole.
 
 Query side: `osmflat_ext::multipolygon` (shared ring-assembly algorithm plus
 `MultipolygonsQuery`), `osmflat_ext::coastline` (`CoastlineQuery`), and
@@ -438,6 +468,16 @@ with collision check against the parent.
 then stream-write postings. Trades the resident map for disk I/O; pick per the
 `--mmap`/RAM budget, same dial as the combine design's perm arrays.
 
+**As implemented,** neither is needed: the parent's `tags` vector is already
+deduplicated, so a tag slot `t` *is* the parent tag index and Phase 1/2 read it
+straight from `tags_index`. Phase 0 only groups slots by key (a hash map over
+keys) and sorts. A resident `pos[t]` vector maps each slot to its output
+position. Postings and offsets are `u64` arrays from `Scratch` (RAM, or
+unlinked mmap temp files with `--mmap-scratch`), converted to 5-byte `Ref`s
+only when written. After the main write, `--key-postings` streams a k-way merge
+per key, and `--value-search` runs its own count-then-fill over value strings
+(§4).
+
 ### 6.3 Backrefs build
 
 Two CSR two-pass builds (node→ways from `nodes_index`; X→relations from
@@ -446,13 +486,53 @@ parent index rather than a tag slot — so no dictionary phase.
 
 ### 6.4 Memory / scratch budget
 
-| structure | size (planet, order) | lifetime | notes |
+Build-time structures, as implemented (`T` = tag references =
+`tags_index.len()`, `S` = distinct tags = `tags.len()`):
+
+| structure | size | lifetime | backing |
 |---|---|---|---|
-| `(key,value) → slot` map | ~distinct (k,v) × ~16 B | Phases 0–2 | resident, or replaced by external sort |
-| tag postings | ~`tags_index.len()` × 5 B | written out | mmap temp at planet |
-| CSR offset counters | ~slots × 3 × 8 B | Phases 1–2 | resident, small |
-| backref postings | ~(`nodes_index`+`Σmembers`) × 5 B | written out | mmap temp |
-| dictionaries (`keys`,`values`) | small | output | — |
+| key → slots grouping | ~S × 8 B | Phase 0 → write | RAM |
+| `pos[t]` slot → position | S × 8 B | Phases 1–2 | RAM |
+| CSR offsets + fill cursors | 2 × 3 × S × 8 B | Phases 1–2 | `Scratch` |
+| tag postings | T × 8 B | Phase 2 → write | `Scratch` |
+| key-postings merge | O(values of one key) heap | per key | RAM, streamed to output |
+| trigram counts / offsets | ~distinct trigrams × ~24 B | value search | RAM (small) |
+| trigram postings | Σ distinct trigrams per value × 8 B | value search | `Scratch` |
+| tag-pair mentions (`--combinations`) | Σ pairs × 16 B | combinations | sequential bucket files |
+| key-pair counts, per-tag combo lists | see §10 limitation 4 | combinations | RAM |
+| backref postings | ~(`nodes_index` + Σ members) × 8 B | backrefs | `Scratch` |
+
+### 6.5 Measured: United States extract
+
+Parent `us.osm.flat` (50 GB): T ≈ 707 M tag references, S ≈ 35.6 M distinct
+tags. On a 16 GB laptop with `--mmap-scratch`, `--taginfo --key-postings
+--value-search` built in **6 min 27 s** (peak RSS 9.3 GB, which counts mapped
+scratch pages):
+
+| phase | time |
+|---|---|
+| dictionary | 10.5 s |
+| count | 61 s |
+| fill | 163 s |
+| write (keys, values, postings, values_by_count) | 22 s |
+| key postings | 71 s |
+| value search | 59 s |
+
+Output sizes in the full sidecar `us.osmflat.ext` (44 GB; built with
+`--taginfo --combinations --key-postings --value-search --backrefs
+--multipolygons`):
+
+| resource | size |
+|---|---|
+| backrefs | 24 GB |
+| `tag_combos` / `combos` | 10 GB / 19 MB |
+| key postings (nodes / ways / relations) | 3.3 GB (656 MB / 2.6 GB / 28 MB) |
+| tag postings (node / way / rel) | 3.3 GB (656 MB / 2.6 GB / 28 MB) |
+| value search (postings / trigrams) | 2.0 GB / 1.3 MB |
+| multipolygons | 1.0 GB |
+| `values` / `values_by_count` / `keys` | 849 MB / 176 MB / 736 KB |
+
+`verify` over the taginfo build checked every resource in 4 min 36 s.
 
 ---
 
