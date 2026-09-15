@@ -440,39 +440,57 @@ osm.node_by_osm_id(123)?;                            // binary search ids.nodes_
 | `.key(k)?.stats()` | `KeyView::counts()`, `KeyView::distinct_values()` |
 | `search_keys_prefix` | `TaginfoQuery::keys_with_prefix` |
 | `kv(k, v)?.nodes()` / `ways_in_bbox` | `ValueView::{nodes, ways, relations}` and `{nodes, ways, relations}_in_bbox` |
-| `k=*` | `KeyView::{nodes, ways, relations}` |
-| `ext.query().with_tag(..).in_bbox(..).ways()` | `ExtArchive::query() -> query::Query`: `with_tag`, `in_bbox`, `within_radius`, `in_polygon` (all ANDed), resolved by `nodes()` / `ways()` / `relations()` to `Result<Vec<u64>, QueryError>`. Lower level: `query::Selection` and `query::{intersect, union, intersect_bbox}` |
+| `k=*` | `KeyView::{nodes, ways, relations}` and `{nodes, ways, relations}_in_bbox` |
+| `ext.query().with_tag(..).in_bbox(..).ways()` | `ExtArchive::query() -> query::Query`: `with_tag`, `with_key`, `in_bbox`, `within_radius`, `in_polygon` (all ANDed), resolved by `nodes()` / `ways()` / `relations()` to `Result<Vec<u64>, QueryError>`. Lower level: `query::Selection` and `query::{intersect, union, intersect_bbox}` |
 | `backrefs().relations_containing_way` | `BackrefsQuery::{ways_using_node, relations_with_node, relations_with_way, relations_with_relation}` |
 | `osm.node_by_osm_id` | `osmflat::{node_idx_by_id, way_idx_by_id, relation_idx_by_id}` in the parent crate |
 
 ### Query-side non-bbox spatial (item 4) — no sidecar
 
-Built on the existing SFC order; pure lib code in `osmflat_ext::spatial`.
-Implemented for **nodes only**:
+Built on the existing SFC order; pure lib code in `osmflat_ext::spatial`, for
+nodes, ways, and relations:
 
-- **radius** (`nodes_within_radius`) — one bbox query around the point, refined
-  by exact squared distance, nearest-first.
-- **k-NN** (`k_nearest_nodes`) — expanding square: query a small square around
-  the point, keep the k best in a bounded heap, and double the square until
-  the k-th best distance is within its half-width (every closer node is then
-  inside the square, so the result is exact). `O(k)` memory. Reuses
-  `find_nodes_by_bounding_box`.
-- **polygon** (`nodes_in_polygon`) — bbox-of-polygon prefilter via the spatial
-  query, then exact point-in-polygon.
+- **radius** (`{nodes,ways,relations}_within_radius`) — one bbox query around
+  the point, refined by an exact distance test, nearest-first.
+- **k-NN** (`k_nearest_{nodes,ways,relations}`) — expanding square: query a
+  small square around the point, keep the k best in a bounded heap, and double
+  the square until the k-th best distance is within its half-width (every
+  closer entity then has a point inside the square, so its bbox overlaps it and
+  the result is exact). `O(k)` memory.
+- **polygon** (`{nodes,ways,relations}_in_polygon`) — bbox-of-polygon prefilter
+  via the spatial query, then an exact test.
+
+**Geometry semantics: any part touches.** A node is its point. A way is its
+resolved node sequence as a linestring (unresolvable refs dropped; a
+single-node way is a point); it matches a radius if any segment comes within
+it, and a polygon if any vertex is inside or any segment crosses an edge
+(boundary included). A closed way is still a line: it doesn't match a shape it
+merely encloses. A relation matches if any member node, member way, or member
+relation (recursively, each relation once, so cycles terminate) does. Its
+k-NN / radius distance is to its nearest member geometry.
+
+All containment tests are exact integer math in archive units: point-segment
+distance compares `cross² ≤ r²·len²` in `u128` (a float fallback only for
+globe-spanning overflow), and segment intersection uses orientation signs with
+collinear-overlap handling. k-NN ordering for ways and relations uses `f64`
+distances, so it settles one archive unit early to stay exact.
+
+Candidates come from osmflat's bbox queries — a way's recomputed bbox, a
+relation's **stored** bbox — so a relation whose stored bbox doesn't cover its
+members can be missed. Query boxes are clamped to the world first; osmflat's
+way / relation curves panic on a box past ±180 / ±90.
 
 **Composing with tag filters** goes through `ExtArchive::query()`
-(`query::Query`). Tag postings are intersected smallest-first; each spatial
-constraint is then applied as the ascending entity-index ranges of its bbox (a
-range merge-join, §3), and a radius or polygon constraint runs its exact test
-only on the survivors. The exact tests are the same `RadiusFilter` /
-`PolygonFilter` the standalone functions use, so both agree on every edge case.
-A tag that doesn't exist short-circuits to an empty result before any spatial
-work.
-
-**Not yet:** way and relation variants of radius / k-NN / polygon (for polygon,
-a bbox-overlap-then-segment refine for ways). Until then `Query` rejects
-`within_radius` / `in_polygon` on `ways()` / `relations()` with
-`QueryError::NodesOnly` rather than silently widening to the bbox.
+(`query::Query`). Exact tags are intersected smallest-first; `with_key`
+(`key=*`) and spatial constraints then clip that set as ascending entity-index
+ranges (a range merge-join, §3), and a radius or polygon constraint runs its
+exact test only on the survivors. With no exact tags, spatial constraints run
+before `key=*` so a large key's union is clipped early. `key=*` clipping
+leapfrogs each value's postings against the ranges (binary-searching past
+gaps), so it costs about the smaller of the postings and the ranges. The exact
+tests are the same `RadiusFilter` / `PolygonFilter` the standalone functions
+use, so both agree on every edge case. A tag or key that doesn't exist
+short-circuits to an empty result before any spatial work.
 
 ---
 
@@ -539,7 +557,8 @@ limitations.
 | non-bbox spatial vs. exact scan (k-NN across dense ties, sparse, world-corner centers) | `osmflat-ext/tests/spatial.rs` |
 | staleness: identical rebuild opens; extra node/way/relation/tag or longer string refuses | `osmflat-extc/tests/staleness.rs` (schema-hash and replication-sequence mismatches are not exercised: the fixture can't vary them) |
 | `k=v ⊆ k=*` and `k=*` length = key count | `osmflat-extc/tests/synthetic.rs` |
-| `Query` = intersection of each constraint computed on its own (tag scan, bbox query, standalone radius/polygon), across tag × spatial combinations and all three entity types; error cases | `osmflat-extc/tests/query_builder.rs` |
+| `Query` = intersection of each constraint computed on its own (tag / `key=*` scan, bbox query, standalone radius/polygon), across tag × key × spatial combinations and all three entity types; `KeyView::*_in_bbox`; boxes past the world edge; error cases | `osmflat-extc/tests/query_builder.rs` |
+| way / relation radius, polygon, k-NN vs. a brute-force oracle reading the parent with no prefilter (single-node ways, nested / self / cyclic relations, concave and sliver polygons, far and world-corner centers) | `osmflat-extc/tests/way_spatial.rs`; exact primitives at the boundary in `osmflat-ext/src/spatial.rs` unit tests |
 | differential on a real extract | `cargo run --release --example verify` (layout, bounds, sort orders, count sums; sampled membership cross-check) |
 | merge-join commutativity | not yet |
 
@@ -573,13 +592,11 @@ limitations.
 
 1. **Done.** `Taginfo` schema + compiler (`--taginfo`, phases 0–2) + query API
    + `k=v ∩ bbox` merge-join. **(the taginfo.openstreetmap core)**
-2. **Partly done.** Query lib polish:
-   - done: non-bbox spatial for nodes (radius, k-NN, polygon); `key=*` via
-     `KeyView`; id lookup (provided by the parent `osmflat::ids`); query
-     builder (`ExtArchive::query()`) composing tags with bbox / radius /
-     polygon;
-   - not yet: way/relation spatial (radius, k-NN, polygon); `key=*` within a
-     bbox (and as a `Query` constraint).
+2. **Done.** Query lib polish: non-bbox spatial (radius, k-NN, polygon) for
+   nodes, ways, and relations; `key=*` via `KeyView`, within a bbox, and as a
+   `Query` constraint; id lookup (provided by the parent `osmflat::ids`); query
+   builder (`ExtArchive::query()`) composing tags and keys with bbox / radius /
+   polygon.
 3. **Done.** `Backrefs` (`--backrefs`).
 4. **Partly done.** Taginfo extensions:
    - done: `--combinations` (key and tag co-occurrence);

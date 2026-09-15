@@ -222,9 +222,15 @@ $ cargo run --release --example spatial -- us.osm.flat --limit 5 polygon -77.04 
   merge-join: bbox candidates come from osmflat's own exact spatial query,
   get run-length compressed to contiguous index ranges, and merge-join the tag
   postings via `query::intersect_bbox` (`O(R·log k)`).
-- `spatial::{nodes_within_radius,k_nearest_nodes,nodes_in_polygon}` provide
-  node radius, nearest-neighbor, and polygon queries with `f64` lon/lat
-  arguments and no extension sidecar.
+- `spatial::{nodes,ways,relations}_within_radius`,
+  `spatial::k_nearest_{nodes,ways,relations}`, and
+  `spatial::{nodes,ways,relations}_in_polygon` provide radius,
+  nearest-neighbor, and polygon queries with `f64` lon/lat arguments and no
+  extension sidecar. Ways and relations match when any part touches: any
+  segment of a way, or any member (recursively) of a relation.
+- `KeyView::{nodes,ways,relations}` give `key=*` (any value), and
+  `KeyView::{nodes,ways,relations}_in_bbox` clip it to a bbox without scanning
+  every posting of a large key.
 - `ExtArchive::query()` composes tag and spatial constraints into one query,
   resolved to ascending parent indices:
 
@@ -237,11 +243,11 @@ $ cargo run --release --example spatial -- us.osm.flat --limit 5 polygon -77.04 
       .nodes()?; // or .ways() / .relations()
   ```
 
-  Every constraint is ANDed: tag postings are intersected smallest-first, each
-  `in_bbox` / `within_radius` / `in_polygon` clips them to its bbox's index
-  ranges, and radius / polygon then run their exact test only on the survivors.
-  `within_radius` and `in_polygon` apply to nodes only for now; on ways or
-  relations the query returns `QueryError::NodesOnly`.
+  Every constraint is ANDed: exact tags are intersected smallest-first,
+  `with_key` (`key=*`) and each `in_bbox` / `within_radius` / `in_polygon`
+  clip them to index ranges, and radius / polygon then run their exact test
+  only on the survivors. Radius and polygon apply to ways and relations with
+  the same any-part-touches rule as the standalone functions.
 - `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
   keys (`KeyView::combinations`) and per-tag co-occurring `key=value` pairs
   (`ValueView::combinations`).
