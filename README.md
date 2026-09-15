@@ -187,6 +187,21 @@ $ cargo run --release --example spatial -- us.osm.flat --limit 5 radius -77.0365
   node   4460667768  idx=1355997984 lon=-77.0364638  lat=38.8977038   (no descriptive tags)
   ... (+37810)
 
+$ cargo run --release --example spatial -- us.osm.flat --limit 5 nearest -77.0365 38.8977 --k 10
+10 nearest node(s) to (-77.0365, 38.8977)
+  node   8226202329  idx=1356762763 lon=-77.0364883  lat=38.8977038   (no descriptive tags)
+  node   4460667769  idx=1355997985 lon=-77.0365317  lat=38.8977038   (no descriptive tags)
+  node   4466546707  idx=1355999109 lon=-77.0364643  lat=38.8977023   (no descriptive tags)
+  node   8226288017  idx=1356762952 lon=-77.0364639  lat=38.8977020   (no descriptive tags)
+  node   4460667768  idx=1355997984 lon=-77.0364638  lat=38.8977038   (no descriptive tags)
+  ... (+5)
+
+$ cargo run --release --example spatial -- us.osm.flat nearest -125.5 40.0 --k 3
+3 nearest node(s) to (-125.5, 40)
+  node    527817142  idx=170371021 lon=-124.7155565 lat=40.3799507   (no descriptive tags)
+  node    527817140  idx=170371019 lon=-124.7139451 lat=40.3766823   (no descriptive tags)
+  node    527817122  idx=170371001 lon=-124.7170933 lat=40.3832401   (no descriptive tags)
+
 $ cargo run --release --example spatial -- us.osm.flat --limit 5 polygon -77.04 38.89 -77.01 38.89 -77.01 38.91 -77.04 38.91
 76095 node(s) inside polygon with 4 vertices
   node     49716126  idx=1354417631 lon=-77.0380519  lat=38.8963551   (no descriptive tags)
