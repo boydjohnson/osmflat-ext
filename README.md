@@ -317,8 +317,8 @@ The `--combinations` co-occurrence maps are built with in-RAM hash maps even
 under `--mmap-scratch`; at planet scale prefer building combinations on a
 machine with RAM to match, or skip the flag.
 
-The parent `osmflat` crate is resolved from the `feature/spatial-index` branch
-of <https://github.com/boydjohnson/osmflat-rs>.
+The parent `osmflat` crate is resolved from the `main` branch of
+<https://github.com/boydjohnson/osmflat-rs>.
 
 ## License
 
