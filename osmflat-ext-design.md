@@ -1,10 +1,14 @@
 # Design: `osmflat-ext` — sidecar indexes & query support for osmflat archives
 
-Status: draft design doc (NOT in the repo). Target branch context:
-`feature/spatial-index`, where **array order is the spatial index** (nodes by
-`ZCurve2D`, ways/relations by `XZ2SFC` of their bounding box) and the optional
-`Ids` sub-archive carries OSM ids plus `*_by_id` permutations for reverse
-(OSM id → index) lookup.
+Status: living design doc. Most of it is implemented; §11 tracks what is done
+and what remains. The parent format is the osmflat fork at
+<https://github.com/boydjohnson/osmflat-rs> (`main`), where **array order is
+the spatial index** (nodes by `ZCurve2D`, ways/relations by `XZ2SFC` of their
+bounding box) and the optional `Ids` sub-archive carries OSM ids plus
+`*_by_id` permutations for reverse (OSM id → index) lookup.
+
+The authoritative schema is [`osmflat-ext/flatdata/ext.flatdata`](osmflat-ext/flatdata/ext.flatdata);
+the schema snippets below show the design shape and may abbreviate it.
 
 This crate adds the capabilities the base format can't do efficiently —
 inverted tag index, taginfo-style histograms, reverse references, and non-bbox
@@ -61,20 +65,31 @@ namespace osm_ext;
 const u64 INVALID_IDX = 0xFFFFFFFFFF;
 
 archive Ext {
-    /// Fingerprint of the exact parent archive this sidecar indexes (§8).
+    /// Fingerprint of the exact parent archive this sidecar indexes (below).
     header: ExtHeader;
+    /// This archive's own strings (the builder version `builder_idx` names).
+    stringtable: raw_data;
 
     /// Inverted tag index + taginfo histograms (§4).
     @optional taginfo: archive Taginfo;
 
     /// Reverse references (§5).
     @optional backrefs: archive Backrefs;
+
+    /// Precomputed multipolygon relation ring assembly (§5a).
+    @optional multipolygons: archive Multipolygons;
+
+    /// Precomputed global coastline ring assembly, land/water classified (§5a).
+    @optional coastline: archive Coastline;
+
+    /// Land polygons imported from an external coastline dataset (§5a).
+    @optional land_polygons: archive LandPolygons;
 }
 ```
 
 Each capability is an **optional sub-archive**, mirroring `@optional ids:
 archive Ids` in the parent: build only what you need (`--taginfo`,
-`--backrefs`).
+`--backrefs`, `--multipolygons`, `--coastline`, `--land-polygons <shapefile>`).
 
 ### The staleness hazard and the fingerprint
 
@@ -100,8 +115,6 @@ struct ExtHeader {
     /// This tool's version (into this archive's own stringtable).
     builder_idx: u64 : 40;
 }
-
-// ...also needs its own stringtable for builder_idx
 ```
 
 The query layer opens parent + sidecar together and asserts the fingerprint
@@ -112,7 +125,7 @@ different parent; rebuild").
 
 ## 3. The lever: the inverted index composes with the spatial index for free
 
-On `feature/spatial-index`, **entity index order *is* SFC order**. If tag
+In the spatially ordered parent, **entity index order *is* SFC order**. If tag
 postings store parent entity indices **ascending** — which they do naturally
 when the compiler fills them by iterating entities in index order — then a
 postings list is *already spatially sorted*.
@@ -128,8 +141,8 @@ A bbox query returns a small set of contiguous entity-index ranges
 ```
 
 No temporary hash set, no rescan, no re-sort. This merge-join is the headline
-feature and the reason to build the inverted index on this branch specifically.
-It generalizes:
+feature and the reason to build the inverted index on a spatially ordered
+parent specifically. It generalizes:
 
 - **tag ∩ tag** — merge-join two ascending postings lists, O(k₁+k₂).
 - **tag ∩ bbox** — as above.
@@ -212,25 +225,41 @@ archive Taginfo {
 | top values for a key | values pre-sortable by count at build, or sort `O(values)` at query | — |
 
 `key=*` (entities with a key regardless of value) is a k-way merge over the
-key's value postings; each operand is ascending, so it streams. If `key=*`
-turns out hot, add an optional fourth postings region per `KeyEntry`
-(key-level postings) at the cost of duplicating refs.
+key's value postings; each operand is ascending, so it streams. Implemented as
+`KeyView::{nodes, ways, relations}` over `query::union`, with no stored
+key-level postings. If `key=*` turns out hot, add an optional fourth postings
+region per `KeyEntry` (key-level postings) at the cost of duplicating refs.
 
-### Taginfo "combinations" (phase 2)
+### Taginfo "combinations" (`--combinations`)
 
 taginfo's "other keys used by objects that have this key" is a sparse key×key
-co-occurrence matrix. Building it means, per entity, enumerating its key-pairs
-and incrementing — heavier than the linear passes above. Defer to phase 2 as an
-optional addition:
+co-occurrence matrix, and "other tags used by objects that have this tag" a
+sparse tag×tag one. Building them means, per entity, enumerating its pairs and
+incrementing — heavier than the linear passes above — so they are an optional
+addition to `Taginfo`, built only with `--combinations` (which implies
+`--taginfo`):
 
 ```
-struct ComboEntry { other_key_idx: u64 : 40; together_count: u64 : 40; }
-// add to KeyEntry:  @range(combos) combo_first_idx: u64 : 40;
-// add to archive:   combos: vector<ComboEntry>;   // per key, sorted by count desc
+struct ComboEntry    { other_key_idx: u64 : 40; together_count: u64 : 40; }
+struct TagComboEntry { other_key_idx: u64 : 40; other_value_idx: u64 : 40;
+                       together_count: u64 : 40; }
+// KeyEntry   += @range(combos)     combo_first_idx:     u64 : 40;
+// ValueEntry += @range(tag_combos) tag_combo_first_idx: u64 : 40;
+// Taginfo    += combos:     vector<ComboEntry>;     // per key, count desc, then key string
+//               tag_combos: vector<TagComboEntry>;  // per tag, count desc, then key/value string
 ```
 
-Build via an external "emit (key_i,key_j,entity) pairs → sort → reduce" pass
-(see §6's planet strategy); v1 of `--taginfo` ships without it.
+Both vectors are empty in a sidecar built without `--combinations`.
+
+**Build.** Tag-pair mentions are radix-bucketed by tag slot into a fixed
+number of sequential, append-only streams in one pass (backed by
+`--mmap-scratch` at scale), then each bucket is sorted and run-length-encoded
+on its own. A direct CSR fill was tried first, but its writes scatter across
+the whole mentions array and thrash the page cache on country-scale extracts.
+Key-pair counts stay in RAM: they are bounded by the number of distinct key
+sets, not by the near-unique per-entity value tags. Each bucket is loaded into
+RAM while it is sorted, and the final deduplicated per-tag co-occurrence lists
+are held in RAM until they are written out.
 
 ---
 
@@ -271,6 +300,35 @@ backref) and one pass over `relation_members` (each member contributes an
 X→relation backref). CSR two-pass (count, then fill); ascending fill order again
 gives spatially-ordered postings, so backref results compose with bbox the same
 way tags do.
+
+---
+
+## 5a. Rendering sub-archives — multipolygons, coastline, land polygons
+
+Not part of the original taginfo/backrefs scope; added so renderers (e.g.
+`osmflat-mapnik-plugin`) get fillable areas without re-assembling rings on
+every query. They follow the same sidecar rules: optional, fingerprinted, and
+built from the finished parent.
+
+| sub-archive | flag | contents | stores |
+|---|---|---|---|
+| `Multipolygons` | `--multipolygons` | each `type=multipolygon`/`type=boundary` relation's outer/inner ways stitched into closed rings, once, at build time; relation → polygons → rings → nodes | parent node indices |
+| `Coastline` | `--coastline` | every `natural=coastline` way stitched into closed rings, classified land/water by winding ("land on the left"), sorted by area descending | parent node indices |
+| `LandPolygons` | `--land-polygons <shapefile>` | rings imported from an external, already-closed dataset (osmdata.openstreetmap.de `land-polygons`, EPSG:3857 reprojected to WGS84), clipped to the parent's bbox, sorted by area descending | raw scaled coordinates |
+
+Sorting rings by area descending lets a renderer paint largest-first and get
+arbitrarily deep nesting (island in a bay in a sea) right with no explicit
+hole/exterior pairing.
+
+`LandPolygons` is a deliberate exception to "store indices, not data": the
+external rings have no correspondence to parent nodes. It exists because
+`--coastline` alone can only close islands and enclosed lakes — a mainland
+coastline in any bounded extract is an open chain that never closes into a
+ring.
+
+Query side: `osmflat_ext::multipolygon` (shared ring-assembly algorithm plus
+`MultipolygonsQuery`), `osmflat_ext::coastline` (`CoastlineQuery`), and
+`osmflat_ext::land_polygons` (`LandPolygonsQuery`).
 
 ---
 
@@ -349,7 +407,7 @@ Opens parent + `Ext` together, checks the fingerprint, then:
 
 ```rust
 let osm = osmflat::Osm::open(parent)?;
-let ext = osmflat_ext::Ext::open(sidecar, &osm)?;   // verifies §8 fingerprint
+let ext = osmflat_ext::Ext::open(sidecar, &osm)?;   // verifies §2 fingerprint
 
 // taginfo
 ext.tags().key("highway")?.stats();                 // O(1) counts by type
@@ -373,18 +431,40 @@ ext.backrefs().relations_containing_way(way_idx);
 osm.node_by_osm_id(123)?;                            // binary search ids.nodes_by_id
 ```
 
+**As implemented**, the names differ from the sketch above:
+
+| sketch | implemented |
+|---|---|
+| `Ext::open(sidecar, &osm)` | `ExtArchive::open(parent, ext)` (fingerprint checked, returns `fingerprint::Mismatch`) |
+| `ext.tags()` | `ExtArchive::taginfo() -> Option<TaginfoQuery>` |
+| `.key(k)?.stats()` | `KeyView::counts()`, `KeyView::distinct_values()` |
+| `search_keys_prefix` | `TaginfoQuery::keys_with_prefix` |
+| `kv(k, v)?.nodes()` / `ways_in_bbox` | `ValueView::{nodes, ways, relations}` and `{nodes, ways, relations}_in_bbox` |
+| `k=*` | `KeyView::{nodes, ways, relations}` |
+| `ext.query().with_tag(..).in_bbox(..)` | **not yet**: only the low-level `query::Selection` (takes postings slices and bbox index ranges), plus `query::{intersect, union, intersect_bbox}` |
+| `backrefs().relations_containing_way` | `BackrefsQuery::{ways_using_node, relations_with_node, relations_with_way, relations_with_relation}` |
+| `osm.node_by_osm_id` | `osmflat::{node_idx_by_id, way_idx_by_id, relation_idx_by_id}` in the parent crate |
+
 ### Query-side non-bbox spatial (item 4) — no sidecar
 
-Built on the existing SFC order; pure lib code:
+Built on the existing SFC order; pure lib code in `osmflat_ext::spatial`.
+Implemented for **nodes only**:
 
-- **radius / k-NN** — seed with the cell containing the point, expand bbox in
-  rings, refine by true distance, stop when the k-th best is closer than the
-  ring boundary. Reuses `find_*_by_bounding_box`.
-- **polygon** — bbox-of-polygon prefilter via the spatial query, then exact
-  point-in-polygon (nodes) / bbox-overlap-then-segment test (ways) refine.
+- **radius** (`nodes_within_radius`) — one bbox query around the point, refined
+  by exact squared distance, nearest-first.
+- **k-NN** (`k_nearest_nodes`) — expanding square: query a small square around
+  the point, keep the k best in a bounded heap, and double the square until
+  the k-th best distance is within its half-width (every closer node is then
+  inside the square, so the result is exact). `O(k)` memory. Reuses
+  `find_nodes_by_bounding_box`.
+- **polygon** (`nodes_in_polygon`) — bbox-of-polygon prefilter via the spatial
+  query, then exact point-in-polygon.
 
-These compose with tag filters through the same ascending-run merge: a
-spatial candidate set is a set of index ranges; intersect with tag postings.
+**Not yet:** way and relation variants (for polygon, a bbox-overlap-then-segment
+refine for ways), and composing spatial results with tag filters. The design
+is that a spatial candidate set is a set of ascending index ranges to intersect
+with tag postings, but the spatial functions currently return plain index
+lists.
 
 ---
 
@@ -393,23 +473,32 @@ spatial candidate set is a set of index ranges; intersect with tag postings.
 Mirror the `osmflat` (lib) / `osmflatc` (lib+bin) split:
 
 ```
-osmflat-ext        (lib)  flatdata reader bindings for the Ext archive
-                          + query API (§7) + non-bbox spatial + id-lookup helper
-osmflat-extc       (bin)  the compiler (§6); subcommands --taginfo --backrefs
+osmflat-ext        (lib)      flatdata reader bindings for the Ext archive
+                              + query API (§7) + non-bbox spatial
+osmflat-extc       (lib+bin)  the compiler (§6); the lib holds the build code
+                              the binary wraps, plus `test-support` fixtures
 ```
+
+Id lookup lives in the parent `osmflat` crate (`osmflat::ids`), not here.
 
 `osmflat-extc` depends on `osmflat` for the reader and reuses nothing of the
-parent's writer except the flatdata builder for the sidecar. CLI sketch:
+parent's writer except the flatdata builder for the sidecar. CLI:
 
 ```
-osmflat-extc [--out DIR] [--mmap-scratch DIR] [--taginfo] [--backrefs] PARENT
-  PARENT           input osmflat archive dir
-  --out DIR        output Ext archive dir (default: PARENT sibling .ext)
-  --taginfo        build the Taginfo sub-archive
-  --backrefs       build the Backrefs sub-archive
-  --combinations   also build taginfo co-occurrence (phase 2; implies --taginfo)
-  --mmap-scratch   back postings build with mmap temp files here (planet scale)
+osmflat-extc [OPTIONS] PARENT
+  PARENT                    input osmflat archive dir
+  --out DIR                 output Ext archive dir (default: PARENT sibling .ext)
+  --taginfo                 build the Taginfo sub-archive
+  --combinations            also build taginfo key/tag co-occurrence (implies --taginfo)
+  --backrefs                build the Backrefs sub-archive
+  --multipolygons           build the Multipolygons sub-archive (§5a)
+  --coastline               build the Coastline sub-archive (§5a)
+  --land-polygons PATH      build the LandPolygons sub-archive from a shapefile (§5a)
+  --mmap-scratch DIR        back the build with mmap temp files here (planet scale)
 ```
+
+At least one sub-archive flag is required. `--help` also lists the §10
+limitations.
 
 ---
 
@@ -433,33 +522,61 @@ osmflat-extc [--out DIR] [--mmap-scratch DIR] [--taginfo] [--backrefs] PARENT
 - **Property.** Postings of `k=v` ⊆ entities of `k=*`; Σ value counts of a key =
   key count; merge-join is commutative in the result set.
 
+**Where these live.**
+
+| item | status |
+|---|---|
+| unit oracles: taginfo, combinations, backrefs, `k=v ∩ bbox` (each also with `--mmap-scratch`) | `osmflat-extc/tests/synthetic.rs` |
+| multipolygon / coastline precomputed-vs-live, land-polygon import | `osmflat-extc/tests/{multipolygons,coastline,land_polygons}.rs` |
+| non-bbox spatial vs. exact scan (k-NN across dense ties, sparse, world-corner centers) | `osmflat-ext/tests/spatial.rs` |
+| staleness: identical rebuild opens; extra node/way/relation/tag or longer string refuses | `osmflat-extc/tests/staleness.rs` (schema-hash and replication-sequence mismatches are not exercised: the fixture can't vary them) |
+| `k=v ⊆ k=*` and `k=*` length = key count | `osmflat-extc/tests/synthetic.rs` |
+| differential on a real extract | `cargo run --release --example verify` (layout, bounds, sort orders, count sums; sampled membership cross-check) |
+| merge-join commutativity | not yet |
+
 ---
 
 ## 10. Known limitations (state in `--help` / README)
 
 1. **Sidecar is parent-bound.** Stores parent indices; invalid against any
-   other/rebuilt parent (caught by §8 fingerprint, not silently).
+   other/rebuilt parent (caught by the §2 fingerprint, not silently).
 2. **Build cost ≈ data size.** Postings are O(tags_index); planet needs scratch
    disk, like osmflatc's RocksDB phase.
 3. **Substring value search not indexed.** `keys`/`values` are prefix-searchable
    (string-sorted); arbitrary substring search over ~10⁸ planet values is a scan
    or a future n-gram sidecar.
-4. **Combinations are phase 2.** v1 `--taginfo` has no co-occurrence table.
+4. **Combinations are only partly external.** `--combinations` spills raw
+   tag-pair mentions to `--mmap-scratch`, but key-pair counts, each bucket while
+   it is sorted, and the final per-tag co-occurrence lists stay resident; at
+   planet scale build combinations on a machine with RAM to match, or skip the
+   flag.
 5. **No geometry stored.** Spatial refinement (radius/polygon) recomputes from
    the parent, inheriting the way-bbox recompute cost noted in the spatial
-   summary.
+   summary. (`LandPolygons` is the one exception: it stores imported
+   coordinates.)
+6. **`--coastline` only closes rings.** A mainland coastline in a bounded
+   extract is an open chain, so only islands and enclosed water become areas;
+   use `--land-polygons` for mainland land fill.
 
 ---
 
 ## 11. Phased roadmap
 
-1. `Taginfo` schema + compiler (`--taginfo`, phases 0–2) + query API +
-   `k=v ∩ bbox` merge-join. **(the taginfo.openstreetmap core)**
-2. `osmflat-ext` query lib polish: boolean tag composition, id-lookup helper
-   over the parent `Ids` permutation, non-bbox spatial (radius/k-NN/polygon).
-3. `Backrefs` (`--backrefs`).
-4. Taginfo `--combinations`; optional `key=*` postings region; substring/n-gram
-   value search.
+1. **Done.** `Taginfo` schema + compiler (`--taginfo`, phases 0–2) + query API
+   + `k=v ∩ bbox` merge-join. **(the taginfo.openstreetmap core)**
+2. **Partly done.** Query lib polish:
+   - done: non-bbox spatial for nodes (radius, k-NN, polygon); `key=*` via
+     `KeyView`; id lookup (provided by the parent `osmflat::ids`);
+   - not yet: string-level boolean query builder (`with_tag(..).in_bbox(..)`);
+     way/relation spatial; composing spatial results with tag postings;
+     `key=*` within a bbox.
+3. **Done.** `Backrefs` (`--backrefs`).
+4. **Partly done.** Taginfo extensions:
+   - done: `--combinations` (key and tag co-occurrence);
+   - not yet: optional stored `key=*` postings region; substring/n-gram value
+     search; per-key "top-N by count" table.
+5. **Done** (added after the original plan). Rendering sub-archives (§5a):
+   `--multipolygons`, `--coastline`, `--land-polygons`.
 
 ---
 
@@ -467,15 +584,22 @@ osmflat-extc [--out DIR] [--mmap-scratch DIR] [--taginfo] [--backrefs] PARENT
 
 - **Slot map vs. external sort** for the tag build at planet scale — resident
   `(k,v)→t` hash (simpler, ~hundreds of MB) vs. emit-sort-reduce tuples (more
-  I/O, flat memory). Default to resident with `--mmap-scratch` fallback?
+  I/O, flat memory). *Resolved:* the parent's `tags` are already deduplicated,
+  so a slot is just the parent tag index and no slot map is needed; postings
+  are count-then-fill with `--mmap-scratch` backing.
 - **`key=*` postings** — derive by k-way merge at query time (no storage) vs.
   store a per-key postings region (duplicates refs, ~2× tag postings)?
+  *Currently:* derived at query time (`KeyView::{nodes, ways, relations}`).
 - **Value ordering within a key** — by string (enables value prefix search) vs.
   by count desc (enables instant "top values"). String wins for search; add a
   small per-key "top-N by count" side table if needed.
 - **Fingerprint strength** — counts + schema hash, or a full content hash of the
   parent vectors? Counts+schema is cheap and catches rebuilds; a content hash is
-  stronger but costs a full parent read at build.
+  stronger but costs a full parent read at build. *Currently:* counts +
+  stringtable length + replication sequence + schema hash. Note the schema hash
+  is of the `osmflat` schema compiled into the binary, not the parent's
+  embedded schema bytes (opening a parent with an incompatible schema already
+  fails), so it guards reader/writer drift rather than the parent itself.
 - **One Ext archive or per-capability archives?** Optional sub-archives under one
   `Ext` (chosen here) vs. fully separate `.taginfo` / `.backrefs` dirs. Sub-
   archives keep one fingerprint/header; separate dirs decouple distribution.

@@ -3,10 +3,35 @@
 use clap::Parser;
 use std::path::PathBuf;
 
+/// Known limitations, shown by `--help` (design doc §10).
+const LIMITATIONS: &str = "\
+Known limitations:
+  1. A sidecar is bound to one parent build. It stores parent indices, so it is
+     invalid against any other or rebuilt parent; opening it against one fails
+     with a fingerprint mismatch. Rebuild the sidecar whenever the parent changes.
+  2. Build cost scales with the data. Postings are proportional to the parent's
+     tag occurrences; at planet scale use --mmap-scratch on a fast disk.
+  3. --combinations is only partly backed by --mmap-scratch: raw tag pairs go to
+     scratch, but key-pair counts, each bucket while it is sorted, and the final
+     per-tag co-occurrence lists are held in RAM. At planet scale use a machine
+     with RAM to match, or skip the flag.
+  4. Only exact and key-prefix lookups are indexed; there is no substring search.
+  5. No geometry is stored (except --land-polygons, which stores the imported
+     coordinates). Spatial queries recompute from the parent.
+  6. --coastline only produces closed rings: islands and fully enclosed water.
+     A mainland coastline in a bounded extract never closes; use
+     --land-polygons <shapefile> for mainland land fill.";
+
 /// Build osmflat-ext sidecar archives (inverted tag index / taginfo, reverse
-/// references) from an existing osmflat archive.
+/// references, precomputed multipolygon / coastline / land-polygon rings)
+/// from an existing osmflat archive.
 #[derive(Parser, Debug)]
-#[command(name = "osmflat-extc", version)]
+#[command(
+    name = "osmflat-extc",
+    version,
+    after_help = "See --help for known limitations.",
+    after_long_help = LIMITATIONS
+)]
 struct Args {
     /// Input osmflat archive directory (the parent `Osm` archive).
     parent: PathBuf,

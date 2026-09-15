@@ -313,9 +313,11 @@ cargo build --workspace --examples --all-features
 
 ## Current Limitation
 
-The `--combinations` co-occurrence maps are built with in-RAM hash maps even
-under `--mmap-scratch`; at planet scale prefer building combinations on a
-machine with RAM to match, or skip the flag.
+`--combinations` is only partly backed by `--mmap-scratch`. The raw tag-pair
+mentions are written to scratch in sequential buckets, but the key-pair counts,
+each bucket while it is sorted, and the final per-tag co-occurrence lists are
+held in RAM. At planet scale prefer building combinations on a machine with RAM
+to match, or skip the flag.
 
 The parent `osmflat` crate is resolved from the `main` branch of
 <https://github.com/boydjohnson/osmflat-rs>.
