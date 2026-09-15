@@ -43,49 +43,62 @@ fn sorted_indices<'a, T: 'a>(base: &[T], items: impl Iterator<Item = &'a T>) -> 
     v
 }
 
+impl Bbox {
+    /// This bbox intersected with the world (`[-180, 180] × [-90, 90]`), or
+    /// `None` if they don't intersect or a coordinate is NaN.
+    ///
+    /// osmflat's way and relation curves assert their query box lies within
+    /// the world, so a box reaching past it (a radius around a point near the
+    /// antimeridian or a pole) would panic. No entity lies outside the world,
+    /// so clamping never changes a result.
+    fn clamped_to_world(self) -> Option<Bbox> {
+        let clamped = Bbox {
+            min_lon: self.min_lon.max(-180.0),
+            min_lat: self.min_lat.max(-90.0),
+            max_lon: self.max_lon.min(180.0),
+            max_lat: self.max_lat.min(90.0),
+        };
+        let nan = [self.min_lon, self.min_lat, self.max_lon, self.max_lat]
+            .iter()
+            .any(|v| v.is_nan());
+        (!nan && clamped.min_lon <= clamped.max_lon && clamped.min_lat <= clamped.max_lat)
+            .then_some(clamped)
+    }
+}
+
 /// Ascending node indices whose nodes fall in `bbox`, via osmflat's exact
 /// spatial query. Drift-free: the candidate ranges and exact-overlap filter are
-/// osmflat's own.
+/// osmflat's own. The box is clamped to the world first.
 pub fn node_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
-    let base = archive.nodes();
+    let Some(b) = bbox.clamped_to_world() else {
+        return Vec::new();
+    };
     sorted_indices(
-        base,
-        osmflat::find_nodes_by_bounding_box(
-            archive,
-            bbox.min_lon,
-            bbox.min_lat,
-            bbox.max_lon,
-            bbox.max_lat,
-        ),
+        archive.nodes(),
+        osmflat::find_nodes_by_bounding_box(archive, b.min_lon, b.min_lat, b.max_lon, b.max_lat),
     )
 }
 
 /// Ascending way indices overlapping `bbox`. See [`node_indices_in_bbox`].
 pub fn way_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
-    let base = archive.ways();
+    let Some(b) = bbox.clamped_to_world() else {
+        return Vec::new();
+    };
     sorted_indices(
-        base,
-        osmflat::find_ways_by_bounding_box(
-            archive,
-            bbox.min_lon,
-            bbox.min_lat,
-            bbox.max_lon,
-            bbox.max_lat,
-        ),
+        archive.ways(),
+        osmflat::find_ways_by_bounding_box(archive, b.min_lon, b.min_lat, b.max_lon, b.max_lat),
     )
 }
 
 /// Ascending relation indices overlapping `bbox`. See [`node_indices_in_bbox`].
 pub fn relation_indices_in_bbox(archive: &Osm, bbox: Bbox) -> Vec<u64> {
-    let base = archive.relations();
+    let Some(b) = bbox.clamped_to_world() else {
+        return Vec::new();
+    };
     sorted_indices(
-        base,
+        archive.relations(),
         osmflat::find_relations_by_bounding_box(
-            archive,
-            bbox.min_lon,
-            bbox.min_lat,
-            bbox.max_lon,
-            bbox.max_lat,
+            archive, b.min_lon, b.min_lat, b.max_lon, b.max_lat,
         ),
     )
 }
@@ -147,23 +160,29 @@ pub fn intersect<'a>(a: &'a [Ref], b: &'a [Ref]) -> impl Iterator<Item = u64> + 
 /// for `N` total postings across `k` lists, `O(k)` memory, and lazy — taking
 /// the first `m` results costs `O(m log k)`, not a full materialize-and-sort.
 pub fn union<'a>(lists: &[&'a [Ref]]) -> impl Iterator<Item = u64> + 'a {
+    union_iters(lists.iter().map(|l| l.iter().map(|p| p.value())).collect())
+}
+
+/// [`union`] over arbitrary ascending iterators.
+pub(crate) fn union_iters<I: Iterator<Item = u64>>(
+    mut cursors: Vec<I>,
+) -> impl Iterator<Item = u64> {
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
 
-    // One cursor per list; the heap holds each cursor's next value, keyed
-    // `(value, list)` so equal values pop deterministically.
-    let mut cursors: Vec<std::slice::Iter<'a, Ref>> = lists.iter().map(|l| l.iter()).collect();
+    // The heap holds each cursor's next value, keyed `(value, cursor)` so
+    // equal values pop deterministically.
     let mut heap: BinaryHeap<Reverse<(u64, usize)>> = cursors
         .iter_mut()
         .enumerate()
-        .filter_map(|(k, c)| c.next().map(|p| Reverse((p.value(), k))))
+        .filter_map(|(k, c)| c.next().map(|v| Reverse((v, k))))
         .collect();
 
     let mut last: Option<u64> = None;
     std::iter::from_fn(move || {
         while let Some(Reverse((v, k))) = heap.pop() {
-            if let Some(p) = cursors[k].next() {
-                heap.push(Reverse((p.value(), k)));
+            if let Some(next) = cursors[k].next() {
+                heap.push(Reverse((next, k)));
             }
             if last != Some(v) {
                 last = Some(v);
@@ -224,6 +243,36 @@ impl<'a> Selection<'a> {
     }
 }
 
+/// The postings in `postings` that fall in the ascending, disjoint `ranges`,
+/// ascending.
+///
+/// Leapfrogs instead of scanning: a posting before the current range jumps
+/// (binary search) to the range's start, and a range ending before the current
+/// posting jumps to the first range that could hold it. Each jump that yields
+/// nothing skips a whole range or a whole gap of postings, so the cost is about
+/// `O(min(k, R) · log)` plus the output, whichever of the postings or the
+/// ranges is sparser.
+pub(crate) fn clip_postings<'a>(
+    postings: &'a [Ref],
+    ranges: &'a [Range<u64>],
+) -> impl Iterator<Item = u64> + 'a {
+    let (mut pos, mut r) = (0usize, 0usize);
+    std::iter::from_fn(move || loop {
+        let v = postings.get(pos)?.value();
+        if ranges.get(r)?.end <= v {
+            r += ranges[r..].partition_point(|range| range.end <= v);
+            continue;
+        }
+        let start = ranges[r].start;
+        if v < start {
+            pos += postings[pos..].partition_point(|p| p.value() < start);
+            continue;
+        }
+        pos += 1;
+        return Some(v);
+    })
+}
+
 /// Keep the members of ascending `acc` that fall in the ascending, disjoint
 /// `ranges`. `O(R·log n)`.
 fn clip_to_ranges(acc: &[u64], ranges: &[Range<u64>]) -> Vec<u64> {
@@ -251,14 +300,9 @@ pub enum QueryError {
     /// The query has no tag and no spatial constraint; resolving it would
     /// return every entity of the type.
     Unconstrained,
-    /// A tag constraint was given but the sidecar has no `Taginfo` sub-archive
-    /// (build it with `osmflat-extc --taginfo`).
+    /// A tag or key constraint was given but the sidecar has no `Taginfo`
+    /// sub-archive (build it with `osmflat-extc --taginfo`).
     NoTaginfo,
-    /// `within_radius` / `in_polygon` currently only apply to nodes.
-    NodesOnly {
-        constraint: &'static str,
-        entity: EntityType,
-    },
     /// A spatial constraint has non-finite coordinates, a negative radius, an
     /// inverted bbox, or a polygon with fewer than 3 vertices.
     InvalidSpatial(&'static str),
@@ -267,14 +311,11 @@ pub enum QueryError {
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Unconstrained => write!(f, "query has no tag or spatial constraint"),
+            Self::Unconstrained => write!(f, "query has no tag, key, or spatial constraint"),
             Self::NoTaginfo => write!(
                 f,
-                "tag constraint needs a Taginfo sub-archive; rebuild with osmflat-extc --taginfo"
+                "tag/key constraint needs a Taginfo sub-archive; rebuild with osmflat-extc --taginfo"
             ),
-            Self::NodesOnly { constraint, entity } => {
-                write!(f, "{constraint} only applies to nodes, not {entity:?}")
-            }
             Self::InvalidSpatial(why) => write!(f, "invalid spatial constraint: {why}"),
         }
     }
@@ -296,10 +337,15 @@ enum ExactFilter {
 }
 
 impl ExactFilter {
-    fn contains(&self, node: &osmflat::Node) -> bool {
-        match self {
-            Self::Radius(f) => f.contains(node),
-            Self::Polygon(f) => f.contains(node),
+    fn matches(&self, parent: &osmflat::Osm, entity: EntityType, idx: usize) -> bool {
+        use crate::spatial::{relation_touches, way_touches};
+        match (self, entity) {
+            (Self::Radius(f), EntityType::Node) => f.contains(&parent.nodes()[idx]),
+            (Self::Polygon(f), EntityType::Node) => f.contains(&parent.nodes()[idx]),
+            (Self::Radius(f), EntityType::Way) => way_touches(parent, idx, f),
+            (Self::Polygon(f), EntityType::Way) => way_touches(parent, idx, f),
+            (Self::Radius(f), EntityType::Relation) => relation_touches(parent, idx, f),
+            (Self::Polygon(f), EntityType::Relation) => relation_touches(parent, idx, f),
         }
     }
 }
@@ -307,10 +353,12 @@ impl ExactFilter {
 /// A tag + spatial query over a verified [`crate::ExtArchive`], resolved to
 /// ascending parent indices of one entity type.
 ///
-/// Every constraint is ANDed. Tag postings are intersected smallest-first;
-/// each spatial constraint is then applied as the ascending entity-index
-/// ranges of its bbox (a range merge-join, design §3), and radius / polygon
-/// constraints refine only the survivors by their exact test.
+/// Every constraint is ANDed. Exact tags are intersected smallest-first;
+/// `key=*` constraints and spatial constraints then clip that set as ascending
+/// entity-index ranges (a range merge-join, design §3), and radius / polygon
+/// constraints refine only the survivors by their exact test. Ways and
+/// relations match a radius or polygon when any part touches it (see
+/// [`crate::spatial`]).
 ///
 /// ```ignore
 /// let cafes = archive
@@ -324,6 +372,7 @@ impl ExactFilter {
 pub struct Query<'a> {
     archive: &'a crate::ExtArchive,
     tags: Vec<(Vec<u8>, Vec<u8>)>,
+    keys: Vec<Vec<u8>>,
     spatial: Vec<Constraint>,
 }
 
@@ -333,6 +382,7 @@ impl<'a> Query<'a> {
         Self {
             archive,
             tags: Vec::new(),
+            keys: Vec::new(),
             spatial: Vec::new(),
         }
     }
@@ -344,6 +394,12 @@ impl<'a> Query<'a> {
         self
     }
 
+    /// Require the entity to carry `key` with any value (`key=*`).
+    pub fn with_key(mut self, key: impl AsRef<[u8]>) -> Self {
+        self.keys.push(key.as_ref().to_vec());
+        self
+    }
+
     /// Require the entity to fall in (nodes) or overlap (ways, relations)
     /// `bbox`, using osmflat's exact bbox query.
     pub fn in_bbox(mut self, bbox: Bbox) -> Self {
@@ -351,15 +407,17 @@ impl<'a> Query<'a> {
         self
     }
 
-    /// Require the node to be within `radius` degrees of `(lon, lat)`,
-    /// boundary included. Nodes only.
+    /// Require the entity to come within `radius` degrees of `(lon, lat)`,
+    /// boundary included: a node's point, any segment of a way, or any member
+    /// geometry of a relation.
     pub fn within_radius(mut self, lon: f64, lat: f64, radius: f64) -> Self {
         self.spatial.push(Constraint::Radius { lon, lat, radius });
         self
     }
 
-    /// Require the node to be inside `polygon` (a ring of `lon`/`lat` points),
-    /// boundary included. Nodes only.
+    /// Require the entity to touch `polygon` (a ring of `lon`/`lat` points),
+    /// boundary included: a node inside it, a way with any segment inside or
+    /// crossing it, or a relation with any such member.
     pub fn in_polygon(mut self, polygon: &[crate::spatial::Point]) -> Self {
         self.spatial.push(Constraint::Polygon(polygon.to_vec()));
         self
@@ -381,7 +439,7 @@ impl<'a> Query<'a> {
     }
 
     fn resolve(&self, entity: EntityType) -> Result<Vec<u64>, QueryError> {
-        if self.tags.is_empty() && self.spatial.is_empty() {
+        if self.tags.is_empty() && self.keys.is_empty() && self.spatial.is_empty() {
             return Err(QueryError::Unconstrained);
         }
         let parent = self.archive.parent();
@@ -402,12 +460,6 @@ impl<'a> Query<'a> {
                     (*bbox, None)
                 }
                 Constraint::Radius { lon, lat, radius } => {
-                    if entity != EntityType::Node {
-                        return Err(QueryError::NodesOnly {
-                            constraint: "within_radius",
-                            entity,
-                        });
-                    }
                     let filter = crate::spatial::RadiusFilter::new(parent, *lon, *lat, *radius)
                         .ok_or(QueryError::InvalidSpatial(
                             "within_radius needs a finite center and a finite, non-negative radius",
@@ -415,12 +467,6 @@ impl<'a> Query<'a> {
                     (filter.bbox, Some(ExactFilter::Radius(filter)))
                 }
                 Constraint::Polygon(polygon) => {
-                    if entity != EntityType::Node {
-                        return Err(QueryError::NodesOnly {
-                            constraint: "in_polygon",
-                            entity,
-                        });
-                    }
                     let filter = crate::spatial::PolygonFilter::new(parent, polygon).ok_or(
                         QueryError::InvalidSpatial(
                             "in_polygon needs at least 3 vertices with finite coordinates",
@@ -432,26 +478,87 @@ impl<'a> Query<'a> {
         }
 
         let mut acc: Option<Vec<u64>> = None;
-        if !self.tags.is_empty() {
+        let mut key_views = Vec::with_capacity(self.keys.len());
+        if !self.tags.is_empty() || !self.keys.is_empty() {
             let taginfo = self.archive.taginfo().ok_or(QueryError::NoTaginfo)?;
-            let mut selection = Selection::new();
-            for (key, value) in &self.tags {
-                // An absent tag matches nothing; skip the spatial work.
-                let Some(view) = taginfo.kv(key, value) else {
+            // An absent tag or key matches nothing; skip all further work.
+            for key in &self.keys {
+                let Some(view) = taginfo.key(key) else {
                     return Ok(Vec::new());
                 };
-                selection = selection.and(match entity {
-                    EntityType::Node => view.nodes(),
-                    EntityType::Way => view.ways(),
-                    EntityType::Relation => view.relations(),
-                });
+                key_views.push(view);
             }
-            acc = Some(selection.resolve());
+            if !self.tags.is_empty() {
+                let mut selection = Selection::new();
+                for (key, value) in &self.tags {
+                    let Some(view) = taginfo.kv(key, value) else {
+                        return Ok(Vec::new());
+                    };
+                    selection = selection.and(match entity {
+                        EntityType::Node => view.nodes(),
+                        EntityType::Way => view.ways(),
+                        EntityType::Relation => view.relations(),
+                    });
+                }
+                acc = Some(selection.resolve());
+            }
+        }
+        // Smallest `key=*` first, by its stored per-type count.
+        key_views.sort_by_key(|view| {
+            let counts = view.counts();
+            match entity {
+                EntityType::Node => counts.nodes,
+                EntityType::Way => counts.ways,
+                EntityType::Relation => counts.relations,
+            }
+        });
+
+        // With no exact tags to start from, narrow spatially before expanding
+        // any `key=*` union; otherwise keys clip the (usually smaller) tag set.
+        if acc.is_none() && !key_views.is_empty() && !spatial.is_empty() {
+            acc = self.apply_spatial(entity, acc, spatial);
+            acc = Self::apply_keys(entity, acc, &key_views);
+        } else {
+            acc = Self::apply_keys(entity, acc, &key_views);
+            acc = self.apply_spatial(entity, acc, spatial);
         }
 
+        Ok(acc.unwrap_or_default())
+    }
+
+    /// AND each `key=*` into `acc`. With an existing set, only the key's
+    /// postings inside that set's index ranges are merged.
+    fn apply_keys(
+        entity: EntityType,
+        mut acc: Option<Vec<u64>>,
+        keys: &[crate::taginfo::KeyView<'_>],
+    ) -> Option<Vec<u64>> {
+        for view in keys {
+            if acc.as_ref().is_some_and(Vec::is_empty) {
+                break;
+            }
+            acc = Some(match acc {
+                // `to_index_ranges(prev)` covers exactly `prev`, so the clipped
+                // union is already a subset of it.
+                Some(prev) => view.postings_within(entity, &to_index_ranges(&prev)),
+                None => view.postings_of(entity).collect(),
+            });
+        }
+        acc
+    }
+
+    /// AND each spatial constraint into `acc`: clip to its bbox's index ranges,
+    /// then apply its exact test, if any.
+    fn apply_spatial(
+        &self,
+        entity: EntityType,
+        mut acc: Option<Vec<u64>>,
+        spatial: Vec<(Bbox, Option<ExactFilter>)>,
+    ) -> Option<Vec<u64>> {
+        let parent = self.archive.parent();
         for (bbox, exact) in spatial {
             if acc.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Vec::new());
+                break;
             }
             let in_box = match entity {
                 EntityType::Node => node_indices_in_bbox(parent, bbox),
@@ -463,13 +570,11 @@ impl<'a> Query<'a> {
                 Some(prev) => clip_to_ranges(&prev, &to_index_ranges(&in_box)),
             };
             if let Some(exact) = exact {
-                let nodes = parent.nodes();
-                next.retain(|&idx| exact.contains(&nodes[idx as usize]));
+                next.retain(|&idx| exact.matches(parent, entity, idx as usize));
             }
             acc = Some(next);
         }
-
-        Ok(acc.unwrap_or_default())
+        acc
     }
 }
 

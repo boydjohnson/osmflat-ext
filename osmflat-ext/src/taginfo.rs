@@ -10,8 +10,18 @@
 //! All postings are ascending parent indices, i.e. spatial (SFC) order, so they
 //! compose with bbox queries and with each other via [`crate::query`].
 
+use crate::query::EntityType;
 use crate::{ComboEntry, KeyEntry, Ref, TagComboEntry, Taginfo, ValueEntry};
 use osmflat::Osm;
+
+/// The `ValueView` postings accessor for `entity`.
+fn value_postings<'a>(entity: EntityType) -> fn(&ValueView<'a>) -> &'a [Ref] {
+    match entity {
+        EntityType::Node => ValueView::nodes,
+        EntityType::Way => ValueView::ways,
+        EntityType::Relation => ValueView::relations,
+    }
+}
 
 /// Object counts split by entity type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -156,6 +166,49 @@ impl<'a> KeyView<'a> {
     /// Relations carrying this key with any value (`key=*`). See [`Self::nodes`].
     pub fn relations(&self) -> impl Iterator<Item = u64> + 'a {
         crate::query::union(&self.postings(ValueView::relations))
+    }
+
+    /// Nodes carrying this key with any value that fall in `bbox`, ascending.
+    ///
+    /// Each value's postings are clipped to the bbox's entity-index ranges by
+    /// leapfrogging (binary-searching past gaps), then merged, so a small bbox
+    /// doesn't scan every posting of a large key.
+    pub fn nodes_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::node_indices_in_bbox(self.q.parent, bbox);
+        self.postings_within(EntityType::Node, &crate::query::to_index_ranges(&idx))
+    }
+
+    /// Ways carrying this key with any value that overlap `bbox`. See
+    /// [`Self::nodes_in_bbox`].
+    pub fn ways_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::way_indices_in_bbox(self.q.parent, bbox);
+        self.postings_within(EntityType::Way, &crate::query::to_index_ranges(&idx))
+    }
+
+    /// Relations carrying this key with any value that overlap `bbox`. See
+    /// [`Self::nodes_in_bbox`].
+    pub fn relations_in_bbox(&self, bbox: crate::query::Bbox) -> Vec<u64> {
+        let idx = crate::query::relation_indices_in_bbox(self.q.parent, bbox);
+        self.postings_within(EntityType::Relation, &crate::query::to_index_ranges(&idx))
+    }
+
+    /// `key=*` for `entity`, ascending (the same merge as [`Self::nodes`]).
+    pub(crate) fn postings_of(&self, entity: EntityType) -> impl Iterator<Item = u64> + 'a {
+        crate::query::union(&self.postings(value_postings(entity)))
+    }
+
+    /// `key=*` for `entity`, restricted to the ascending, disjoint `ranges`.
+    pub(crate) fn postings_within(
+        &self,
+        entity: EntityType,
+        ranges: &[std::ops::Range<u64>],
+    ) -> Vec<u64> {
+        let clipped = self
+            .postings(value_postings(entity))
+            .into_iter()
+            .map(|postings| crate::query::clip_postings(postings, ranges))
+            .collect();
+        crate::query::union_iters(clipped).collect()
     }
 
     /// One postings slice per value of this key, for the given entity type.

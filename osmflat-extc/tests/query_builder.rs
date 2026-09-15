@@ -5,7 +5,10 @@
 
 use osmflat::Osm;
 use osmflat_ext::query::{self, Bbox, EntityType, QueryError};
-use osmflat_ext::spatial::{nodes_in_polygon, nodes_within_radius, Point};
+use osmflat_ext::spatial::{
+    nodes_in_polygon, nodes_within_radius, relations_in_polygon, relations_within_radius,
+    ways_in_polygon, ways_within_radius, Point,
+};
 use osmflat_ext::ExtArchive;
 use osmflat_extc::test_support::{
     build_ext_archive, build_parent_archive, Fixture, MemberSpec, NodeSpec, RelationSpec, TagSpec,
@@ -107,9 +110,22 @@ fn taginfo_archive() -> ExtArchive {
     })
 }
 
+/// A tag constraint: an exact `key=value`, or `key=*`.
+#[derive(Clone, Copy, Debug)]
+enum Term {
+    Tag(&'static str, &'static str),
+    Key(&'static str),
+}
+
 /// Entities of `entity` type carrying the exact tag `key=value`, by scanning
 /// the parent (no sidecar).
 fn tag_by_scan(parent: &Osm, entity: EntityType, key: &str, value: &str) -> BTreeSet<u64> {
+    term_by_scan(parent, entity, key, Some(value))
+}
+
+/// Entities of `entity` type carrying `key` with `value` (any value if `None`),
+/// by scanning the parent (no sidecar).
+fn term_by_scan(parent: &Osm, entity: EntityType, key: &str, value: Option<&str>) -> BTreeSet<u64> {
     let tags = parent.tags();
     let tags_index = parent.tags_index();
     let strings = parent.stringtable();
@@ -117,7 +133,8 @@ fn tag_by_scan(parent: &Osm, entity: EntityType, key: &str, value: &str) -> BTre
         range.into_iter().any(|ti| {
             let tag = &tags[tags_index[ti as usize].value() as usize];
             strings.substring_raw(tag.key_idx() as usize) == key.as_bytes()
-                && strings.substring_raw(tag.value_idx() as usize) == value.as_bytes()
+                && value
+                    .is_none_or(|v| strings.substring_raw(tag.value_idx() as usize) == v.as_bytes())
         })
     };
     let ranges: Vec<std::ops::Range<u64>> = match entity {
@@ -141,20 +158,29 @@ enum Spatial {
 }
 
 impl Spatial {
-    fn applies_to(&self, entity: EntityType) -> bool {
-        matches!(self, Spatial::Bbox(_)) || entity == EntityType::Node
-    }
-
-    /// This constraint's own result, from the independent per-constraint API.
+    /// This constraint's own result, from the standalone per-constraint API
+    /// (itself checked against brute force in `tests/way_spatial.rs` and
+    /// `osmflat-ext/tests/spatial.rs`).
     fn by_itself(&self, parent: &Osm, entity: EntityType) -> BTreeSet<u64> {
+        let as_u64 = |it: &mut dyn Iterator<Item = usize>| it.map(|i| i as u64).collect::<Vec<_>>();
         match (self, entity) {
             (Spatial::Bbox(b), EntityType::Node) => query::node_indices_in_bbox(parent, *b),
             (Spatial::Bbox(b), EntityType::Way) => query::way_indices_in_bbox(parent, *b),
             (Spatial::Bbox(b), EntityType::Relation) => query::relation_indices_in_bbox(parent, *b),
-            (Spatial::Radius(lon, lat, r), _) => nodes_within_radius(parent, *lon, *lat, *r)
-                .map(|i| i as u64)
-                .collect(),
-            (Spatial::Polygon(p), _) => nodes_in_polygon(parent, p).map(|i| i as u64).collect(),
+            (Spatial::Radius(lon, lat, r), EntityType::Node) => {
+                as_u64(&mut nodes_within_radius(parent, *lon, *lat, *r))
+            }
+            (Spatial::Radius(lon, lat, r), EntityType::Way) => {
+                as_u64(&mut ways_within_radius(parent, *lon, *lat, *r))
+            }
+            (Spatial::Radius(lon, lat, r), EntityType::Relation) => {
+                as_u64(&mut relations_within_radius(parent, *lon, *lat, *r))
+            }
+            (Spatial::Polygon(p), EntityType::Node) => as_u64(&mut nodes_in_polygon(parent, p)),
+            (Spatial::Polygon(p), EntityType::Way) => as_u64(&mut ways_in_polygon(parent, p)),
+            (Spatial::Polygon(p), EntityType::Relation) => {
+                as_u64(&mut relations_in_polygon(parent, p))
+            }
         }
         .into_iter()
         .collect()
@@ -179,17 +205,29 @@ fn query_equals_intersection_of_each_constraint() {
     let archive = taginfo_archive();
     let parent = archive.parent();
 
-    let tag_sets: &[&[(&str, &str)]] = &[
+    use Term::{Key, Tag};
+    let term_sets: &[&[Term]] = &[
         &[],
-        &[("amenity", "cafe")],
-        &[("name", "A")],
-        &[("amenity", "cafe"), ("name", "B")],
-        &[("amenity", "bar"), ("name", "C"), ("highway", "crossing")],
-        &[("highway", "primary"), ("name", "A")],
-        &[("type", "route"), ("name", "C")],
+        &[Tag("amenity", "cafe")],
+        &[Tag("name", "A")],
+        &[Tag("amenity", "cafe"), Tag("name", "B")],
+        &[
+            Tag("amenity", "bar"),
+            Tag("name", "C"),
+            Tag("highway", "crossing"),
+        ],
+        &[Tag("highway", "primary"), Tag("name", "A")],
+        &[Tag("type", "route"), Tag("name", "C")],
         // Present key, absent value; and an absent key.
-        &[("amenity", "library")],
-        &[("amenity", "cafe"), ("no_such_key", "x")],
+        &[Tag("amenity", "library")],
+        &[Tag("amenity", "cafe"), Tag("no_such_key", "x")],
+        // key=* alone, with another key, with exact tags, and absent.
+        &[Key("amenity")],
+        &[Key("name")],
+        &[Key("amenity"), Key("name")],
+        &[Tag("highway", "crossing"), Key("name")],
+        &[Key("highway"), Tag("name", "B")],
+        &[Key("no_such_key")],
     ];
     let triangle = vec![
         point(-77.04, 38.86),
@@ -216,11 +254,14 @@ fn query_equals_intersection_of_each_constraint() {
 
     let mut non_empty = 0;
     for entity in [EntityType::Node, EntityType::Way, EntityType::Relation] {
-        for tags in tag_sets {
+        for terms in term_sets {
             for spatial in &spatial_sets {
                 let mut q = archive.query();
-                for (k, v) in tags.iter() {
-                    q = q.with_tag(k, v);
+                for term in terms.iter() {
+                    q = match *term {
+                        Tag(k, v) => q.with_tag(k, v),
+                        Key(k) => q.with_key(k),
+                    };
                 }
                 for s in spatial {
                     q = match s {
@@ -234,24 +275,20 @@ fn query_equals_intersection_of_each_constraint() {
                     EntityType::Way => q.ways(),
                     EntityType::Relation => q.relations(),
                 };
-                let ctx = format!("{entity:?} tags={tags:?} spatial={spatial:?}");
+                let ctx = format!("{entity:?} terms={terms:?} spatial={spatial:?}");
 
-                if tags.is_empty() && spatial.is_empty() {
+                if terms.is_empty() && spatial.is_empty() {
                     assert_eq!(got, Err(QueryError::Unconstrained), "{ctx}");
-                    continue;
-                }
-                if let Some(s) = spatial.iter().find(|s| !s.applies_to(entity)) {
-                    assert!(
-                        matches!(got, Err(QueryError::NodesOnly { entity: e, .. }) if e == entity),
-                        "{ctx}: {s:?} should be rejected, got {got:?}"
-                    );
                     continue;
                 }
 
                 let mut want: Option<BTreeSet<u64>> = None;
-                let constraint_sets = tags
+                let constraint_sets = terms
                     .iter()
-                    .map(|(k, v)| tag_by_scan(parent, entity, k, v))
+                    .map(|term| match *term {
+                        Tag(k, v) => term_by_scan(parent, entity, k, Some(v)),
+                        Key(k) => term_by_scan(parent, entity, k, None),
+                    })
                     .chain(spatial.iter().map(|s| s.by_itself(parent, entity)));
                 for set in constraint_sets {
                     want = Some(match want {
@@ -269,7 +306,40 @@ fn query_equals_intersection_of_each_constraint() {
         }
     }
     // Guard against a fixture where everything is trivially empty.
-    assert!(non_empty >= 40, "only {non_empty} non-empty cases");
+    assert!(non_empty >= 90, "only {non_empty} non-empty cases");
+}
+
+#[test]
+fn key_any_value_in_bbox_matches_scan() {
+    let archive = taginfo_archive();
+    let parent = archive.parent();
+    let taginfo = archive.taginfo().expect("taginfo");
+    let boxes = [
+        bbox(-77.03, 38.87, -76.99, 38.92),
+        bbox(-77.05, 38.85, -76.95, 38.95),
+        bbox(-77.001, 38.899, -77.0, 38.9),
+        bbox(10.0, 10.0, 10.1, 10.1),
+    ];
+    let mut non_empty = 0;
+    for key in ["amenity", "name", "highway", "type"] {
+        let view = taginfo.key(key.as_bytes()).expect("key present");
+        for b in boxes {
+            for (entity, got) in [
+                (EntityType::Node, view.nodes_in_bbox(b)),
+                (EntityType::Way, view.ways_in_bbox(b)),
+                (EntityType::Relation, view.relations_in_bbox(b)),
+            ] {
+                let in_box = Spatial::Bbox(b).by_itself(parent, entity);
+                let want: Vec<u64> = term_by_scan(parent, entity, key, None)
+                    .intersection(&in_box)
+                    .copied()
+                    .collect();
+                assert_eq!(got, want, "{key}=* {entity:?} in {b:?}");
+                non_empty += usize::from(!want.is_empty());
+            }
+        }
+    }
+    assert!(non_empty >= 12, "only {non_empty} non-empty cases");
 }
 
 #[test]
@@ -312,6 +382,40 @@ fn spatial_only_query_works_without_taginfo_but_tags_need_it() {
             .in_bbox(b)
             .nodes(),
         Err(QueryError::NoTaginfo)
+    );
+}
+
+/// Boxes reaching past the world used to panic inside osmflat's way/relation
+/// curve; they're clamped now.
+#[test]
+fn spatial_constraints_past_the_world_edge_do_not_panic() {
+    let archive = taginfo_archive();
+    let past_corner = bbox(170.0, 80.0, 190.0, 95.0);
+    let entirely_outside = bbox(200.0, 95.0, 210.0, 99.0);
+    for b in [past_corner, entirely_outside] {
+        assert_eq!(archive.query().in_bbox(b).ways(), Ok(vec![]));
+        assert_eq!(archive.query().in_bbox(b).relations(), Ok(vec![]));
+        let cafe = archive.taginfo().unwrap().kv(b"amenity", b"cafe").unwrap();
+        assert_eq!(cafe.ways_in_bbox(b), Vec::<u64>::new());
+    }
+    for q in [
+        archive.query().within_radius(180.0, 90.0, 1.0),
+        archive.query().within_radius(-180.0, -90.0, 500.0),
+        archive
+            .query()
+            .in_polygon(&[point(170.0, 80.0), point(200.0, 80.0), point(190.0, 100.0)]),
+    ] {
+        assert!(q.ways().is_ok());
+        assert!(q.relations().is_ok());
+    }
+    // A radius covering the whole world matches every way with geometry.
+    assert_eq!(
+        archive
+            .query()
+            .within_radius(-77.0, 38.9, 400.0)
+            .ways()
+            .map(|w| w.len()),
+        Ok(archive.parent().ways().len())
     );
 }
 
