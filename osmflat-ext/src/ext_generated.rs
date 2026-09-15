@@ -1396,9 +1396,11 @@ impl flatdata::Overlap for LandPolygonRingEntry {}
 impl LandPolygonRingEntry {
     /// 1 if this ring should be painted as land; 0 if it's a hole (e.g. a
 /// lake within a landmass) that should be left as background/water.
-/// Derived the same way as `CoastlineRingEntry.is_land` -- our own
-/// signed-area computation on the (already reprojected) ring, not by
-/// trusting the source dataset's own stated winding convention.
+/// Taken from the shapefile's own `Outer` / `Inner` ring role, not from
+/// signed area: the `shapefile` crate canonicalizes winding to the ESRI
+/// convention (outer rings clockwise), the opposite sense of
+/// `natural=coastline`'s "land on the left" rule that
+/// `CoastlineRingEntry.is_land` relies on.
     #[inline]
     pub fn is_land(&self) -> u8 {
         let value = flatdata_read_bytes!(u8, self.data.as_ptr(), 0, 1);
@@ -1442,9 +1444,11 @@ impl std::cmp::PartialEq for LandPolygonRingEntry {
 impl LandPolygonRingEntry {
     /// 1 if this ring should be painted as land; 0 if it's a hole (e.g. a
 /// lake within a landmass) that should be left as background/water.
-/// Derived the same way as `CoastlineRingEntry.is_land` -- our own
-/// signed-area computation on the (already reprojected) ring, not by
-/// trusting the source dataset's own stated winding convention.
+/// Taken from the shapefile's own `Outer` / `Inner` ring role, not from
+/// signed area: the `shapefile` crate canonicalizes winding to the ESRI
+/// convention (outer rings clockwise), the opposite sense of
+/// `natural=coastline`'s "land on the left" rule that
+/// `CoastlineRingEntry.is_land` relies on.
     #[inline]
     #[allow(missing_docs)]
     pub fn set_is_land(&mut self, value: u8) {
