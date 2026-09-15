@@ -162,7 +162,79 @@ pub fn assemble_rings_and_open_chains(mut segments: Vec<Vec<Vertex>>) -> Assembl
             }
         }
     }
+    let rings = rings.into_iter().flat_map(split_self_touching).collect();
     AssembledRings { rings, open_chains }
+}
+
+/// Split a ring that touches itself at a node into the separate rings it
+/// actually describes.
+///
+/// Two exclaves of the same boundary relation can meet at a single shared
+/// node (Baarle-Hertog has exactly this: a 1.65 km² exclave and a 0.024 km²
+/// one joined at one corner). Stitching alone -- whether by endpoint distance
+/// or by exact node identity -- walks straight through that node and produces
+/// one figure-eight ring instead of two, because at the junction "keep going"
+/// and "close here" are both locally valid. Osmium's area assembler splits at
+/// such a node, and osmium's output is what `compare_plugins` diffs against:
+/// splitting the figure-eight reproduces its two areas exactly, while leaving
+/// it joined loses one polygon and understates the pair's combined area
+/// (the two traversals partially cancel in the shoelace sum).
+///
+/// A ring with no repeated node is returned unchanged, so this only affects
+/// the self-touching case. Pieces too small to enclose area (a spike that
+/// doubles back on one node) are dropped.
+fn split_self_touching(ring: Vec<Vertex>) -> Vec<Vec<Vertex>> {
+    // A ring closed on its own first node repeats it at the end by
+    // construction; that repeat is the closure, not a self-touch.
+    let explicitly_closed =
+        ring.len() > 1 && ring.first().unwrap().node_idx == ring.last().unwrap().node_idx;
+    let body = if explicitly_closed {
+        &ring[..ring.len() - 1]
+    } else {
+        &ring[..]
+    };
+
+    // Common case first: nothing repeats, so the ring stands as assembled.
+    let mut distinct = std::collections::HashSet::with_capacity(body.len());
+    if body.iter().all(|v| distinct.insert(v.node_idx)) {
+        return vec![ring];
+    }
+
+    // Walk the ring keeping the path so far; revisiting a node means
+    // everything since that node forms a closed loop of its own. The junction
+    // node itself stays on the path -- it belongs to both rings.
+    let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
+    let mut out: Vec<Vec<Vertex>> = Vec::new();
+    let mut path: Vec<Vertex> = Vec::new();
+    for v in body {
+        match seen.get(&v.node_idx) {
+            Some(&at) => {
+                let mut loop_ring = path.split_off(at);
+                for w in &loop_ring[1..] {
+                    seen.remove(&w.node_idx);
+                }
+                let anchor = loop_ring[0];
+                path.push(anchor);
+                loop_ring.push(anchor); // close it explicitly
+                if loop_ring.len() >= 4 {
+                    out.push(loop_ring);
+                }
+            }
+            None => {
+                seen.insert(v.node_idx, path.len());
+                path.push(*v);
+            }
+        }
+    }
+
+    if path.len() >= 3 {
+        if explicitly_closed {
+            let first = path[0];
+            path.push(first);
+        }
+        out.push(path);
+    }
+    out
 }
 
 pub fn assemble_rings(segments: Vec<Vec<Vertex>>) -> Vec<Vec<Vertex>> {
@@ -429,6 +501,47 @@ mod tests {
             1,
             "the decoy segment should be left over as its own open chain"
         );
+    }
+
+    /// Reproduces the Baarle-Hertog bug: two exclaves of one boundary
+    /// relation meeting at a single shared node. Stitching walks straight
+    /// through that junction (both "continue" and "close" are locally valid
+    /// there), yielding one figure-eight ring; the assembler has to split it
+    /// back into the two rings osmium's area assembler reports, or a renderer
+    /// draws one polygon too few.
+    #[test]
+    fn ring_assembler_splits_ring_that_touches_itself_at_a_node() {
+        // Big square and small square sharing exactly node 0 at the corner,
+        // presented as one already-closed traversal of both.
+        let figure_eight = vec![
+            v(0, 0.0, 0.0),
+            v(1, 0.0, 1.0),
+            v(2, 1.0, 1.0),
+            v(3, 1.0, 0.0),
+            v(0, 0.0, 0.0),
+            v(4, 0.0, -0.5),
+            v(5, -0.5, -0.5),
+            v(6, -0.5, 0.0),
+            v(0, 0.0, 0.0),
+        ];
+
+        let assembled = assemble_rings_and_open_chains(vec![figure_eight]);
+
+        assert_eq!(
+            assembled.rings.len(),
+            2,
+            "a ring passing through the same node twice is two rings, not one"
+        );
+        assert!(assembled.open_chains.is_empty());
+        for ring in &assembled.rings {
+            assert_eq!(
+                ring.first().unwrap().node_idx,
+                ring.last().unwrap().node_idx,
+                "each split piece must still be explicitly closed"
+            );
+        }
+        let sizes: Vec<usize> = assembled.rings.iter().map(|r| r.len()).collect();
+        assert_eq!(sizes, vec![5, 5]);
     }
 
     /// Reproduces the Elliott Bay bug: once a ring has one stitch behind it,
