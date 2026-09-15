@@ -30,7 +30,7 @@ pub struct Bbox {
 /// recovers the index by offset. Sound because the references point into
 /// `slice` and the structs are `repr(transparent)` with a fixed size.
 #[inline]
-fn slice_index<T>(slice: &[T], item: &T) -> u64 {
+pub(crate) fn slice_index<T>(slice: &[T], item: &T) -> u64 {
     let offset = (item as *const T as usize) - (slice.as_ptr() as usize);
     (offset / std::mem::size_of::<T>()) as u64
 }
