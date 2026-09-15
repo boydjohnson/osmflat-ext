@@ -13,6 +13,17 @@ bbox query.
 
 Full design: [`osmflat-ext-design.md`](./osmflat-ext-design.md).
 
+## Crates
+
+| Crate | Kind | Use it to |
+|---|---|---|
+| `osmflat-extc` | binary | Build an `Ext` archive from an existing osmflat archive (`osmflat-extc --taginfo --out region.osm.ext region.osm.flat`). |
+| `osmflat-ext` | library | Open an `Ext` archive alongside its parent osmflat archive and query it (taginfo, backrefs, multipolygons, coastline/land polygons, bbox merge-joins). |
+
+`osmflat-extc` also exposes a library target — the build logic the binary
+wraps, plus the `test-support` fixtures — but applications reading extension
+archives should depend on `osmflat-ext`.
+
 ## Layout
 
 ```
