@@ -669,3 +669,86 @@ fn key_value_intersect_bbox_merge_join() {
     assert_eq!(residential.ways_in_bbox(BBOX), want_ways);
     assert!(!want_ways.is_empty(), "highway=residential should hit bbox");
 }
+
+/// Entities of one type carrying `key` with any value, ascending and distinct.
+fn key_any_by_scan(map: &HashMap<(Key, Value), Vec<u64>>, key: &[u8]) -> Vec<u64> {
+    let mut out: Vec<u64> = map
+        .iter()
+        .filter(|((k, _), _)| k.as_slice() == key)
+        .flat_map(|(_, entities)| entities.iter().copied())
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+#[test]
+fn key_any_value_postings_match_brute_force_oracle() {
+    let archive = archive(osmflat_extc::BuildOptions {
+        taginfo: true,
+        ..Default::default()
+    });
+    let oracle = TagOracle::build(archive.parent());
+    let taginfo = archive.taginfo().expect("taginfo sub-archive present");
+
+    let mut multi_value_keys = 0;
+    for key_view in taginfo.keys() {
+        let key = key_view.key().to_vec();
+        let name = String::from_utf8_lossy(&key);
+        let nodes: Vec<u64> = key_view.nodes().collect();
+        let ways: Vec<u64> = key_view.ways().collect();
+        let rels: Vec<u64> = key_view.relations().collect();
+
+        assert_eq!(
+            nodes,
+            key_any_by_scan(&oracle.kv_nodes, &key),
+            "{name}=* nodes"
+        );
+        assert_eq!(
+            ways,
+            key_any_by_scan(&oracle.kv_ways, &key),
+            "{name}=* ways"
+        );
+        assert_eq!(
+            rels,
+            key_any_by_scan(&oracle.kv_rels, &key),
+            "{name}=* relations"
+        );
+
+        // `key=*` agrees with the stored per-key counts, and every `k=v` is a
+        // subset of it.
+        let counts = key_view.counts();
+        assert_eq!(nodes.len() as u64, counts.nodes, "{name} node count");
+        assert_eq!(ways.len() as u64, counts.ways, "{name} way count");
+        assert_eq!(rels.len() as u64, counts.relations, "{name} relation count");
+        for value_view in key_view.values() {
+            for (subset, all) in [
+                (value_view.nodes(), &nodes),
+                (value_view.ways(), &ways),
+                (value_view.relations(), &rels),
+            ] {
+                assert!(subset.iter().all(|r| all.binary_search(&r.value()).is_ok()));
+            }
+        }
+
+        if key_view.distinct_values() > 1 {
+            multi_value_keys += 1;
+        }
+    }
+    // The merge is only exercised by keys with several values (e.g. `highway`,
+    // `name`, `type`); make sure the fixture still has some.
+    assert!(multi_value_keys >= 3, "fixture lost its multi-value keys");
+
+    let highway = taginfo.key(b"highway").expect("highway key");
+    assert_eq!(
+        highway.ways().collect::<Vec<_>>().len(),
+        2,
+        "highway=* ways are residential + primary"
+    );
+    assert!(taginfo
+        .key(b"shop")
+        .expect("shop key")
+        .ways()
+        .next()
+        .is_none());
+}

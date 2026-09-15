@@ -139,6 +139,34 @@ impl<'a> KeyView<'a> {
         (r.start..r.end).map(move |i| ValueView { q, idx: i as usize })
     }
 
+    /// Nodes carrying this key with any value (`key=*`), ascending parent node
+    /// indices.
+    ///
+    /// A lazy k-way merge ([`crate::query::union`]) over this key's per-value
+    /// node postings: no stored key-level postings, `O(values)` memory.
+    pub fn nodes(&self) -> impl Iterator<Item = u64> + 'a {
+        crate::query::union(&self.postings(ValueView::nodes))
+    }
+
+    /// Ways carrying this key with any value (`key=*`). See [`Self::nodes`].
+    pub fn ways(&self) -> impl Iterator<Item = u64> + 'a {
+        crate::query::union(&self.postings(ValueView::ways))
+    }
+
+    /// Relations carrying this key with any value (`key=*`). See [`Self::nodes`].
+    pub fn relations(&self) -> impl Iterator<Item = u64> + 'a {
+        crate::query::union(&self.postings(ValueView::relations))
+    }
+
+    /// One postings slice per value of this key, for the given entity type.
+    fn postings(&self, of_type: fn(&ValueView<'a>) -> &'a [Ref]) -> Vec<&'a [Ref]> {
+        let r = self.entry().values();
+        let q = self.q;
+        (r.start..r.end)
+            .map(|i| of_type(&ValueView { q, idx: i as usize }))
+            .collect()
+    }
+
     /// Find one value of this key by exact string (binary search within the
     /// key's value range).
     pub fn value(&self, value: &[u8]) -> Option<ValueView<'a>> {
