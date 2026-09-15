@@ -1,9 +1,11 @@
 //! Non-bbox spatial queries (radius, k-NN, polygon).
 //!
 //! These need **no sidecar**: they build on the parent's existing
-//! space-filling-curve order and its `find_*_by_bounding_box`. They live here
-//! so they compose with tag/backref selections (a spatial candidate set is just
-//! more ascending entity-index ranges to feed [`crate::query`]).
+//! space-filling-curve order and its `find_*_by_bounding_box`. The functions
+//! here return nearest-first or plain index lists; to combine a radius or
+//! polygon with tag filters, use [`crate::query::Query`]
+//! (`ExtArchive::query()`), which applies the same exact tests after a range
+//! merge-join with the tag postings.
 
 use osmflat::Osm;
 use std::collections::{BinaryHeap, HashSet};
@@ -176,7 +178,8 @@ pub fn nodes_in_polygon(archive: &Osm, polygon: &[Point]) -> impl Iterator<Item 
 }
 
 /// Exact "within `radius` degrees of a point" test for nodes, plus the bbox
-/// that prefilters it, so every radius query agrees on every edge case.
+/// that prefilters it. Shared by [`nodes_within_radius`] and
+/// [`crate::query::Query`], so both agree on every edge case.
 pub(crate) struct RadiusFilter {
     /// Square around the circle; every matching node lies inside it.
     pub(crate) bbox: crate::query::Bbox,
@@ -219,11 +222,16 @@ impl RadiusFilter {
             },
         )
     }
+
+    #[inline]
+    pub(crate) fn contains(&self, node: &osmflat::Node) -> bool {
+        self.distance_sq(node) <= self.radius_sq
+    }
 }
 
 /// Exact point-in-polygon test for nodes (boundary included), plus the
-/// polygon's bbox that prefilters it, so every polygon query agrees on every
-/// edge case.
+/// polygon's bbox that prefilters it. Shared by [`nodes_in_polygon`] and
+/// [`crate::query::Query`].
 pub(crate) struct PolygonFilter {
     /// Bbox of the polygon; every matching node lies inside it.
     pub(crate) bbox: crate::query::Bbox,
