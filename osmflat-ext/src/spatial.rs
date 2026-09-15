@@ -1,9 +1,11 @@
 //! Non-bbox spatial queries (radius, k-NN, polygon).
 //!
 //! These need **no sidecar**: they build on the parent's existing
-//! space-filling-curve order and its `find_*_by_bounding_box`. They live here
-//! so they compose with tag/backref selections (a spatial candidate set is just
-//! more ascending entity-index ranges to feed [`crate::query`]).
+//! space-filling-curve order and its `find_*_by_bounding_box`. The functions
+//! here return nearest-first or plain index lists; to combine a radius or
+//! polygon with tag filters, use [`crate::query::Query`]
+//! (`ExtArchive::query()`), which applies the same exact tests after a range
+//! merge-join with the tag postings.
 
 use osmflat::Osm;
 use std::collections::{BinaryHeap, HashSet};
@@ -31,32 +33,16 @@ pub fn nodes_within_radius(
     center_lat: f64,
     radius: f64,
 ) -> impl Iterator<Item = usize> {
-    if radius < 0.0 || !center_lon.is_finite() || !center_lat.is_finite() || !radius.is_finite() {
+    let Some(filter) = RadiusFilter::new(archive, center_lon, center_lat, radius) else {
         return Vec::new().into_iter();
-    }
+    };
 
-    let coord_scale = archive.header().coord_scale();
-    let center = scale_point(center_lon, center_lat, coord_scale);
-    let radius_scaled = scale_radius(radius, coord_scale);
-    let radius_sq = square(radius_scaled as i64);
-    let bbox = bbox_around(
-        center_lon,
-        center_lat,
-        radius_scaled as f64 / coord_scale as f64,
-    );
-    let mut matches: Vec<(i128, usize)> = crate::query::node_indices_in_bbox(archive, bbox)
+    let mut matches: Vec<(i128, usize)> = crate::query::node_indices_in_bbox(archive, filter.bbox)
         .into_iter()
         .filter_map(|idx| {
             let idx = idx as usize;
-            let node = &archive.nodes()[idx];
-            let dist = distance_sq(
-                center,
-                ScaledPoint {
-                    lon: node.lon(),
-                    lat: node.lat(),
-                },
-            );
-            (dist <= radius_sq).then_some((dist, idx))
+            let dist = filter.distance_sq(&archive.nodes()[idx]);
+            (dist <= filter.radius_sq).then_some((dist, idx))
         })
         .collect();
 
@@ -177,36 +163,111 @@ fn nearest_in_bbox(
 ///
 /// Bbox-of-polygon prefilter via the spatial query, then exact point-in-polygon.
 pub fn nodes_in_polygon(archive: &Osm, polygon: &[Point]) -> impl Iterator<Item = usize> {
-    if polygon.len() < 3
-        || polygon
-            .iter()
-            .any(|p| !p.lon.is_finite() || !p.lat.is_finite())
-    {
+    let Some(filter) = PolygonFilter::new(archive, polygon) else {
         return Vec::new().into_iter();
-    }
+    };
 
-    let coord_scale = archive.header().coord_scale();
-    let scaled_polygon: Vec<ScaledPoint> = polygon
-        .iter()
-        .map(|p| scale_point(p.lon, p.lat, coord_scale))
-        .collect();
-    let bbox = polygon_bbox(polygon);
-    crate::query::node_indices_in_bbox(archive, bbox)
+    crate::query::node_indices_in_bbox(archive, filter.bbox)
         .into_iter()
         .filter_map(|idx| {
             let idx = idx as usize;
-            let node = &archive.nodes()[idx];
-            point_in_polygon(
-                ScaledPoint {
-                    lon: node.lon(),
-                    lat: node.lat(),
-                },
-                &scaled_polygon,
-            )
-            .then_some(idx)
+            filter.contains(&archive.nodes()[idx]).then_some(idx)
         })
         .collect::<Vec<_>>()
         .into_iter()
+}
+
+/// Exact "within `radius` degrees of a point" test for nodes, plus the bbox
+/// that prefilters it. Shared by [`nodes_within_radius`] and
+/// [`crate::query::Query`], so both agree on every edge case.
+pub(crate) struct RadiusFilter {
+    /// Square around the circle; every matching node lies inside it.
+    pub(crate) bbox: crate::query::Bbox,
+    center: ScaledPoint,
+    radius_sq: i128,
+}
+
+impl RadiusFilter {
+    /// `None` for a negative or non-finite radius or center.
+    pub(crate) fn new(
+        archive: &Osm,
+        center_lon: f64,
+        center_lat: f64,
+        radius: f64,
+    ) -> Option<Self> {
+        if radius < 0.0 || !center_lon.is_finite() || !center_lat.is_finite() || !radius.is_finite()
+        {
+            return None;
+        }
+        let coord_scale = archive.header().coord_scale();
+        let radius_scaled = scale_radius(radius, coord_scale);
+        Some(Self {
+            bbox: bbox_around(
+                center_lon,
+                center_lat,
+                radius_scaled as f64 / coord_scale as f64,
+            ),
+            center: scale_point(center_lon, center_lat, coord_scale),
+            radius_sq: square(radius_scaled as i64),
+        })
+    }
+
+    #[inline]
+    fn distance_sq(&self, node: &osmflat::Node) -> i128 {
+        distance_sq(
+            self.center,
+            ScaledPoint {
+                lon: node.lon(),
+                lat: node.lat(),
+            },
+        )
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, node: &osmflat::Node) -> bool {
+        self.distance_sq(node) <= self.radius_sq
+    }
+}
+
+/// Exact point-in-polygon test for nodes (boundary included), plus the
+/// polygon's bbox that prefilters it. Shared by [`nodes_in_polygon`] and
+/// [`crate::query::Query`].
+pub(crate) struct PolygonFilter {
+    /// Bbox of the polygon; every matching node lies inside it.
+    pub(crate) bbox: crate::query::Bbox,
+    scaled: Vec<ScaledPoint>,
+}
+
+impl PolygonFilter {
+    /// `None` for fewer than 3 vertices or any non-finite coordinate.
+    pub(crate) fn new(archive: &Osm, polygon: &[Point]) -> Option<Self> {
+        if polygon.len() < 3
+            || polygon
+                .iter()
+                .any(|p| !p.lon.is_finite() || !p.lat.is_finite())
+        {
+            return None;
+        }
+        let coord_scale = archive.header().coord_scale();
+        Some(Self {
+            bbox: polygon_bbox(polygon),
+            scaled: polygon
+                .iter()
+                .map(|p| scale_point(p.lon, p.lat, coord_scale))
+                .collect(),
+        })
+    }
+
+    #[inline]
+    pub(crate) fn contains(&self, node: &osmflat::Node) -> bool {
+        point_in_polygon(
+            ScaledPoint {
+                lon: node.lon(),
+                lat: node.lat(),
+            },
+            &self.scaled,
+        )
+    }
 }
 
 fn bbox_around(center_lon: f64, center_lat: f64, radius: f64) -> crate::query::Bbox {

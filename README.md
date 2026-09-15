@@ -225,6 +225,23 @@ $ cargo run --release --example spatial -- us.osm.flat --limit 5 polygon -77.04 
 - `spatial::{nodes_within_radius,k_nearest_nodes,nodes_in_polygon}` provide
   node radius, nearest-neighbor, and polygon queries with `f64` lon/lat
   arguments and no extension sidecar.
+- `ExtArchive::query()` composes tag and spatial constraints into one query,
+  resolved to ascending parent indices:
+
+  ```rust
+  let cafes = archive
+      .query()
+      .with_tag("amenity", "cafe")
+      .with_tag("wheelchair", "yes")
+      .within_radius(-77.0365, 38.8977, 0.01)
+      .nodes()?; // or .ways() / .relations()
+  ```
+
+  Every constraint is ANDed: tag postings are intersected smallest-first, each
+  `in_bbox` / `within_radius` / `in_polygon` clips them to its bbox's index
+  ranges, and radius / polygon then run their exact test only on the survivors.
+  `within_radius` and `in_polygon` apply to nodes only for now; on ways or
+  relations the query returns `QueryError::NodesOnly`.
 - `osmflat-extc --combinations` augments Taginfo with per-key co-occurring
   keys (`KeyView::combinations`) and per-tag co-occurring `key=value` pairs
   (`ValueView::combinations`).

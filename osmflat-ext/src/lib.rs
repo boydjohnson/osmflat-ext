@@ -80,6 +80,12 @@ impl ExtArchive {
         taginfo::TaginfoQuery::new(&self.parent, self.ext.taginfo()?).into()
     }
 
+    /// Start a combined tag + spatial query (see [`query::Query`]).
+    #[inline]
+    pub fn query(&self) -> query::Query<'_> {
+        query::Query::new(self)
+    }
+
     /// Reverse-reference queries. `None` if built without `--backrefs`.
     #[inline]
     pub fn backrefs(&self) -> Option<backrefs::BackrefsQuery<'_>> {

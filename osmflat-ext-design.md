@@ -441,7 +441,7 @@ osm.node_by_osm_id(123)?;                            // binary search ids.nodes_
 | `search_keys_prefix` | `TaginfoQuery::keys_with_prefix` |
 | `kv(k, v)?.nodes()` / `ways_in_bbox` | `ValueView::{nodes, ways, relations}` and `{nodes, ways, relations}_in_bbox` |
 | `k=*` | `KeyView::{nodes, ways, relations}` |
-| `ext.query().with_tag(..).in_bbox(..)` | **not yet**: only the low-level `query::Selection` (takes postings slices and bbox index ranges), plus `query::{intersect, union, intersect_bbox}` |
+| `ext.query().with_tag(..).in_bbox(..).ways()` | `ExtArchive::query() -> query::Query`: `with_tag`, `in_bbox`, `within_radius`, `in_polygon` (all ANDed), resolved by `nodes()` / `ways()` / `relations()` to `Result<Vec<u64>, QueryError>`. Lower level: `query::Selection` and `query::{intersect, union, intersect_bbox}` |
 | `backrefs().relations_containing_way` | `BackrefsQuery::{ways_using_node, relations_with_node, relations_with_way, relations_with_relation}` |
 | `osm.node_by_osm_id` | `osmflat::{node_idx_by_id, way_idx_by_id, relation_idx_by_id}` in the parent crate |
 
@@ -460,11 +460,19 @@ Implemented for **nodes only**:
 - **polygon** (`nodes_in_polygon`) — bbox-of-polygon prefilter via the spatial
   query, then exact point-in-polygon.
 
-**Not yet:** way and relation variants (for polygon, a bbox-overlap-then-segment
-refine for ways), and composing spatial results with tag filters. The design
-is that a spatial candidate set is a set of ascending index ranges to intersect
-with tag postings, but the spatial functions currently return plain index
-lists.
+**Composing with tag filters** goes through `ExtArchive::query()`
+(`query::Query`). Tag postings are intersected smallest-first; each spatial
+constraint is then applied as the ascending entity-index ranges of its bbox (a
+range merge-join, §3), and a radius or polygon constraint runs its exact test
+only on the survivors. The exact tests are the same `RadiusFilter` /
+`PolygonFilter` the standalone functions use, so both agree on every edge case.
+A tag that doesn't exist short-circuits to an empty result before any spatial
+work.
+
+**Not yet:** way and relation variants of radius / k-NN / polygon (for polygon,
+a bbox-overlap-then-segment refine for ways). Until then `Query` rejects
+`within_radius` / `in_polygon` on `ways()` / `relations()` with
+`QueryError::NodesOnly` rather than silently widening to the bbox.
 
 ---
 
@@ -531,6 +539,7 @@ limitations.
 | non-bbox spatial vs. exact scan (k-NN across dense ties, sparse, world-corner centers) | `osmflat-ext/tests/spatial.rs` |
 | staleness: identical rebuild opens; extra node/way/relation/tag or longer string refuses | `osmflat-extc/tests/staleness.rs` (schema-hash and replication-sequence mismatches are not exercised: the fixture can't vary them) |
 | `k=v ⊆ k=*` and `k=*` length = key count | `osmflat-extc/tests/synthetic.rs` |
+| `Query` = intersection of each constraint computed on its own (tag scan, bbox query, standalone radius/polygon), across tag × spatial combinations and all three entity types; error cases | `osmflat-extc/tests/query_builder.rs` |
 | differential on a real extract | `cargo run --release --example verify` (layout, bounds, sort orders, count sums; sampled membership cross-check) |
 | merge-join commutativity | not yet |
 
@@ -566,10 +575,11 @@ limitations.
    + `k=v ∩ bbox` merge-join. **(the taginfo.openstreetmap core)**
 2. **Partly done.** Query lib polish:
    - done: non-bbox spatial for nodes (radius, k-NN, polygon); `key=*` via
-     `KeyView`; id lookup (provided by the parent `osmflat::ids`);
-   - not yet: string-level boolean query builder (`with_tag(..).in_bbox(..)`);
-     way/relation spatial; composing spatial results with tag postings;
-     `key=*` within a bbox.
+     `KeyView`; id lookup (provided by the parent `osmflat::ids`); query
+     builder (`ExtArchive::query()`) composing tags with bbox / radius /
+     polygon;
+   - not yet: way/relation spatial (radius, k-NN, polygon); `key=*` within a
+     bbox (and as a `Query` constraint).
 3. **Done.** `Backrefs` (`--backrefs`).
 4. **Partly done.** Taginfo extensions:
    - done: `--combinations` (key and tag co-occurrence);

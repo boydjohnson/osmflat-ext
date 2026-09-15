@@ -218,16 +218,258 @@ impl<'a> Selection<'a> {
             acc = intersect_sorted(&acc, term.iter().map(|p| p.value()));
         }
         if let Some(ranges) = self.bbox_ranges {
-            acc = ranges
-                .iter()
-                .flat_map(|r| {
-                    let lo = acc.partition_point(|&v| v < r.start);
-                    let hi = acc.partition_point(|&v| v < r.end);
-                    acc[lo..hi].iter().copied()
-                })
-                .collect();
+            acc = clip_to_ranges(&acc, &ranges);
         }
         acc
+    }
+}
+
+/// Keep the members of ascending `acc` that fall in the ascending, disjoint
+/// `ranges`. `O(R·log n)`.
+fn clip_to_ranges(acc: &[u64], ranges: &[Range<u64>]) -> Vec<u64> {
+    ranges
+        .iter()
+        .flat_map(|r| {
+            let lo = acc.partition_point(|&v| v < r.start);
+            let hi = acc.partition_point(|&v| v < r.end);
+            acc[lo..hi].iter().copied()
+        })
+        .collect()
+}
+
+/// The entity type a [`Query`] resolves to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum EntityType {
+    Node,
+    Way,
+    Relation,
+}
+
+/// Why a [`Query`] could not be resolved.
+#[derive(Clone, Debug, PartialEq)]
+pub enum QueryError {
+    /// The query has no tag and no spatial constraint; resolving it would
+    /// return every entity of the type.
+    Unconstrained,
+    /// A tag constraint was given but the sidecar has no `Taginfo` sub-archive
+    /// (build it with `osmflat-extc --taginfo`).
+    NoTaginfo,
+    /// `within_radius` / `in_polygon` currently only apply to nodes.
+    NodesOnly {
+        constraint: &'static str,
+        entity: EntityType,
+    },
+    /// A spatial constraint has non-finite coordinates, a negative radius, an
+    /// inverted bbox, or a polygon with fewer than 3 vertices.
+    InvalidSpatial(&'static str),
+}
+
+impl std::fmt::Display for QueryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unconstrained => write!(f, "query has no tag or spatial constraint"),
+            Self::NoTaginfo => write!(
+                f,
+                "tag constraint needs a Taginfo sub-archive; rebuild with osmflat-extc --taginfo"
+            ),
+            Self::NodesOnly { constraint, entity } => {
+                write!(f, "{constraint} only applies to nodes, not {entity:?}")
+            }
+            Self::InvalidSpatial(why) => write!(f, "invalid spatial constraint: {why}"),
+        }
+    }
+}
+
+impl std::error::Error for QueryError {}
+
+#[derive(Clone, Debug)]
+enum Constraint {
+    Bbox(Bbox),
+    Radius { lon: f64, lat: f64, radius: f64 },
+    Polygon(Vec<crate::spatial::Point>),
+}
+
+/// The exact refinement a non-bbox spatial constraint applies after its bbox.
+enum ExactFilter {
+    Radius(crate::spatial::RadiusFilter),
+    Polygon(crate::spatial::PolygonFilter),
+}
+
+impl ExactFilter {
+    fn contains(&self, node: &osmflat::Node) -> bool {
+        match self {
+            Self::Radius(f) => f.contains(node),
+            Self::Polygon(f) => f.contains(node),
+        }
+    }
+}
+
+/// A tag + spatial query over a verified [`crate::ExtArchive`], resolved to
+/// ascending parent indices of one entity type.
+///
+/// Every constraint is ANDed. Tag postings are intersected smallest-first;
+/// each spatial constraint is then applied as the ascending entity-index
+/// ranges of its bbox (a range merge-join, design §3), and radius / polygon
+/// constraints refine only the survivors by their exact test.
+///
+/// ```ignore
+/// let cafes = archive
+///     .query()
+///     .with_tag("amenity", "cafe")
+///     .with_tag("wheelchair", "yes")
+///     .within_radius(-77.0365, 38.8977, 0.01)
+///     .nodes()?;
+/// ```
+#[derive(Clone)]
+pub struct Query<'a> {
+    archive: &'a crate::ExtArchive,
+    tags: Vec<(Vec<u8>, Vec<u8>)>,
+    spatial: Vec<Constraint>,
+}
+
+impl<'a> Query<'a> {
+    /// An empty query over `archive`. Prefer [`crate::ExtArchive::query`].
+    pub fn new(archive: &'a crate::ExtArchive) -> Self {
+        Self {
+            archive,
+            tags: Vec::new(),
+            spatial: Vec::new(),
+        }
+    }
+
+    /// Require the exact tag `key=value`.
+    pub fn with_tag(mut self, key: impl AsRef<[u8]>, value: impl AsRef<[u8]>) -> Self {
+        self.tags
+            .push((key.as_ref().to_vec(), value.as_ref().to_vec()));
+        self
+    }
+
+    /// Require the entity to fall in (nodes) or overlap (ways, relations)
+    /// `bbox`, using osmflat's exact bbox query.
+    pub fn in_bbox(mut self, bbox: Bbox) -> Self {
+        self.spatial.push(Constraint::Bbox(bbox));
+        self
+    }
+
+    /// Require the node to be within `radius` degrees of `(lon, lat)`,
+    /// boundary included. Nodes only.
+    pub fn within_radius(mut self, lon: f64, lat: f64, radius: f64) -> Self {
+        self.spatial.push(Constraint::Radius { lon, lat, radius });
+        self
+    }
+
+    /// Require the node to be inside `polygon` (a ring of `lon`/`lat` points),
+    /// boundary included. Nodes only.
+    pub fn in_polygon(mut self, polygon: &[crate::spatial::Point]) -> Self {
+        self.spatial.push(Constraint::Polygon(polygon.to_vec()));
+        self
+    }
+
+    /// Matching parent node indices, ascending.
+    pub fn nodes(&self) -> Result<Vec<u64>, QueryError> {
+        self.resolve(EntityType::Node)
+    }
+
+    /// Matching parent way indices, ascending.
+    pub fn ways(&self) -> Result<Vec<u64>, QueryError> {
+        self.resolve(EntityType::Way)
+    }
+
+    /// Matching parent relation indices, ascending.
+    pub fn relations(&self) -> Result<Vec<u64>, QueryError> {
+        self.resolve(EntityType::Relation)
+    }
+
+    fn resolve(&self, entity: EntityType) -> Result<Vec<u64>, QueryError> {
+        if self.tags.is_empty() && self.spatial.is_empty() {
+            return Err(QueryError::Unconstrained);
+        }
+        let parent = self.archive.parent();
+
+        // Validate every spatial constraint before doing any work.
+        let mut spatial = Vec::with_capacity(self.spatial.len());
+        for constraint in &self.spatial {
+            spatial.push(match constraint {
+                Constraint::Bbox(bbox) => {
+                    let finite = [bbox.min_lon, bbox.min_lat, bbox.max_lon, bbox.max_lat]
+                        .iter()
+                        .all(|v| v.is_finite());
+                    if !finite || bbox.min_lon > bbox.max_lon || bbox.min_lat > bbox.max_lat {
+                        return Err(QueryError::InvalidSpatial(
+                            "in_bbox needs finite coordinates with min <= max",
+                        ));
+                    }
+                    (*bbox, None)
+                }
+                Constraint::Radius { lon, lat, radius } => {
+                    if entity != EntityType::Node {
+                        return Err(QueryError::NodesOnly {
+                            constraint: "within_radius",
+                            entity,
+                        });
+                    }
+                    let filter = crate::spatial::RadiusFilter::new(parent, *lon, *lat, *radius)
+                        .ok_or(QueryError::InvalidSpatial(
+                            "within_radius needs a finite center and a finite, non-negative radius",
+                        ))?;
+                    (filter.bbox, Some(ExactFilter::Radius(filter)))
+                }
+                Constraint::Polygon(polygon) => {
+                    if entity != EntityType::Node {
+                        return Err(QueryError::NodesOnly {
+                            constraint: "in_polygon",
+                            entity,
+                        });
+                    }
+                    let filter = crate::spatial::PolygonFilter::new(parent, polygon).ok_or(
+                        QueryError::InvalidSpatial(
+                            "in_polygon needs at least 3 vertices with finite coordinates",
+                        ),
+                    )?;
+                    (filter.bbox, Some(ExactFilter::Polygon(filter)))
+                }
+            });
+        }
+
+        let mut acc: Option<Vec<u64>> = None;
+        if !self.tags.is_empty() {
+            let taginfo = self.archive.taginfo().ok_or(QueryError::NoTaginfo)?;
+            let mut selection = Selection::new();
+            for (key, value) in &self.tags {
+                // An absent tag matches nothing; skip the spatial work.
+                let Some(view) = taginfo.kv(key, value) else {
+                    return Ok(Vec::new());
+                };
+                selection = selection.and(match entity {
+                    EntityType::Node => view.nodes(),
+                    EntityType::Way => view.ways(),
+                    EntityType::Relation => view.relations(),
+                });
+            }
+            acc = Some(selection.resolve());
+        }
+
+        for (bbox, exact) in spatial {
+            if acc.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(Vec::new());
+            }
+            let in_box = match entity {
+                EntityType::Node => node_indices_in_bbox(parent, bbox),
+                EntityType::Way => way_indices_in_bbox(parent, bbox),
+                EntityType::Relation => relation_indices_in_bbox(parent, bbox),
+            };
+            let mut next = match acc.take() {
+                None => in_box,
+                Some(prev) => clip_to_ranges(&prev, &to_index_ranges(&in_box)),
+            };
+            if let Some(exact) = exact {
+                let nodes = parent.nodes();
+                next.retain(|&idx| exact.contains(&nodes[idx as usize]));
+            }
+            acc = Some(next);
+        }
+
+        Ok(acc.unwrap_or_default())
     }
 }
 
