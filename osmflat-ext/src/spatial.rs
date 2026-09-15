@@ -6,6 +6,7 @@
 //! more ascending entity-index ranges to feed [`crate::query`]).
 
 use osmflat::Osm;
+use std::collections::{BinaryHeap, HashSet};
 
 /// A geographic point in degrees (`lon` = x, `lat` = y).
 #[derive(Debug, Clone, Copy)]
@@ -67,36 +68,109 @@ pub fn nodes_within_radius(
         .into_iter()
 }
 
-/// The `k` nearest node indices to `center`, nearest-first.
+/// The `k` nearest node indices to `center`, nearest-first (ties by index).
 ///
-/// This exact implementation scans all nodes and sorts by distance; the
-/// expanding-ring optimization can replace it without changing results.
+/// Expanding-square search: query the parent's bbox index for a square of
+/// half-width `r` around `center`, keeping the `k` best candidates in a bounded
+/// heap, and double `r` until the `k`th-best distance is `<= r`. Every node
+/// within distance `r` lies inside the square, so at that point no unvisited
+/// node can displace a kept one and the result is exact. Memory is `O(k)`, and
+/// the work is dominated by the final square rather than the whole archive.
 pub fn k_nearest_nodes(archive: &Osm, center_lon: f64, center_lat: f64, k: usize) -> Vec<usize> {
     if k == 0 || !center_lon.is_finite() || !center_lat.is_finite() {
         return Vec::new();
     }
 
-    let center = scale_point(center_lon, center_lat, archive.header().coord_scale());
-    let mut nodes: Vec<(i128, usize)> = archive
-        .nodes()
-        .iter()
-        .enumerate()
-        .map(|(idx, node)| {
-            (
-                distance_sq(
-                    center,
-                    ScaledPoint {
-                        lon: node.lon(),
-                        lat: node.lat(),
-                    },
-                ),
-                idx,
-            )
-        })
-        .collect();
+    let coord_scale = archive.header().coord_scale();
+    let center = scale_point(center_lon, center_lat, coord_scale);
+    let k = k.min(archive.nodes().len());
+    if k == 0 {
+        return Vec::new();
+    }
 
-    nodes.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
-    nodes.into_iter().take(k).map(|(_, idx)| idx).collect()
+    let (lon, lat) = (
+        center.lon as f64 / coord_scale as f64,
+        center.lat as f64 / coord_scale as f64,
+    );
+    let mut half_width = scale_radius(KNN_INITIAL_HALF_WIDTH_DEG, coord_scale).max(1) as i64;
+    loop {
+        // Pad by one archive unit so the degree-space edge filter in the bbox
+        // query can't drop a node sitting exactly on the scaled square's edge.
+        let reach = (half_width + 1) as f64 / coord_scale as f64;
+        let bbox = crate::query::Bbox {
+            min_lon: (lon - reach).max(-180.0),
+            min_lat: (lat - reach).max(-90.0),
+            max_lon: (lon + reach).min(180.0),
+            max_lat: (lat + reach).min(90.0),
+        };
+        let covers_world = bbox.min_lon <= -180.0
+            && bbox.min_lat <= -90.0
+            && bbox.max_lon >= 180.0
+            && bbox.max_lat >= 90.0;
+
+        let best = nearest_in_bbox(archive, center, bbox, k);
+        let settled = best.len() == k
+            && best
+                .peek()
+                .is_some_and(|&(dist, _)| dist <= square(half_width));
+        if settled || covers_world {
+            let mut best = best.into_vec();
+            best.sort_unstable();
+            return best.into_iter().map(|(_, idx)| idx).collect();
+        }
+        half_width *= 2;
+    }
+}
+
+/// Starting half-width of the k-NN search square, in degrees (~50 m of
+/// latitude). Dense areas settle immediately; sparse ones double outward.
+const KNN_INITIAL_HALF_WIDTH_DEG: f64 = 0.0005;
+
+/// The `k` smallest `(distance_sq, index)` pairs among nodes in `bbox`, as a
+/// max-heap (the worst kept candidate on top).
+fn nearest_in_bbox(
+    archive: &Osm,
+    center: ScaledPoint,
+    bbox: crate::query::Bbox,
+    k: usize,
+) -> BinaryHeap<(i128, usize)> {
+    let nodes = archive.nodes();
+    let mut best: BinaryHeap<(i128, usize)> = BinaryHeap::with_capacity(k + 1);
+    // The bbox query may repeat a node across curve ranges; track what's kept.
+    let mut kept: HashSet<usize> = HashSet::with_capacity(k + 1);
+
+    for node in osmflat::find_nodes_by_bounding_box(
+        archive,
+        bbox.min_lon,
+        bbox.min_lat,
+        bbox.max_lon,
+        bbox.max_lat,
+    ) {
+        let idx = crate::query::slice_index(nodes, node) as usize;
+        let candidate = (
+            distance_sq(
+                center,
+                ScaledPoint {
+                    lon: node.lon(),
+                    lat: node.lat(),
+                },
+            ),
+            idx,
+        );
+        if best.len() == k && best.peek().is_some_and(|&worst| candidate >= worst) {
+            continue;
+        }
+        if !kept.insert(idx) {
+            continue;
+        }
+        best.push(candidate);
+        if best.len() > k {
+            if let Some((_, evicted)) = best.pop() {
+                kept.remove(&evicted);
+            }
+        }
+    }
+    best
 }
 
 /// Node indices inside the `polygon` ring, in degrees (`lon` = x, `lat` = y).

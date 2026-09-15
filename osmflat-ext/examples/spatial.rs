@@ -37,33 +37,30 @@ struct Args {
 #[derive(Subcommand)]
 enum Command {
     /// Nodes within radius degrees of a point.
+    #[command(allow_negative_numbers = true)]
     Radius {
         /// Longitude in degrees.
-        #[arg(allow_hyphen_values = true)]
         lon: f64,
         /// Latitude in degrees.
-        #[arg(allow_hyphen_values = true)]
         lat: f64,
         /// Radius in degrees.
-        #[arg(allow_hyphen_values = true)]
         radius: f64,
     },
     /// K nearest nodes to a point.
+    #[command(allow_negative_numbers = true)]
     Nearest {
         /// Longitude in degrees.
-        #[arg(allow_hyphen_values = true)]
         lon: f64,
         /// Latitude in degrees.
-        #[arg(allow_hyphen_values = true)]
         lat: f64,
         /// Number of nearest nodes to return.
         #[arg(long, default_value_t = 10)]
         k: usize,
     },
     /// Nodes inside a polygon ring, supplied as lon/lat pairs.
+    #[command(allow_negative_numbers = true)]
     Polygon {
         /// Polygon coordinates as lon lat lon lat ...
-        #[arg(allow_hyphen_values = true)]
         coords: Vec<f64>,
     },
 }
