@@ -359,3 +359,119 @@ fn substring_search_matches_scan_with_and_without_index() {
     assert!(cafe_upper.contains("CAFÉ ñandú".as_bytes()));
     assert!(!cafe_upper.contains("Café Ñandú".as_bytes()));
 }
+
+/// `counts_within` / `distinct_values_within` take a bbox that was resolved to
+/// ranges once, so a caller sweeping many keys pays the spatial query once
+/// instead of per key. They must agree with the per-value clip they replace --
+/// on both sidecars, since only `full` has stored `key=*` postings and the
+/// other path sums per-value clips.
+#[test]
+fn counts_within_match_per_value_clip() {
+    let (plain, full) = (plain(), full(None));
+    assert!(!plain.taginfo().unwrap().has_key_postings());
+    assert!(full.taginfo().unwrap().has_key_postings());
+
+    let boxes = [
+        // Overlaps part of the fixture.
+        Bbox {
+            min_lon: -77.03,
+            min_lat: 38.87,
+            max_lon: -76.99,
+            max_lat: 38.92,
+        },
+        // Covers all of it.
+        Bbox {
+            min_lon: -78.0,
+            min_lat: 38.0,
+            max_lon: -76.0,
+            max_lat: 39.0,
+        },
+        // Disjoint: every count must come back zero.
+        Bbox {
+            min_lon: 10.0,
+            min_lat: 10.0,
+            max_lon: 10.1,
+            max_lat: 10.1,
+        },
+    ];
+
+    let mut saw_nonzero = false;
+    for archive in [&plain, &full] {
+        let taginfo = archive.taginfo().unwrap();
+        for b in boxes {
+            let nr = query::to_index_ranges(&query::node_indices_in_bbox(archive.parent(), b));
+            let wr = query::to_index_ranges(&query::way_indices_in_bbox(archive.parent(), b));
+            let rr = query::to_index_ranges(&query::relation_indices_in_bbox(archive.parent(), b));
+
+            for key in ["name", "amenity", "highway", "type"] {
+                let k = taginfo.key(key.as_bytes()).unwrap();
+
+                // The per-value sum this replaces.
+                let (mut n, mut w, mut r) = (0u64, 0u64, 0u64);
+                let mut want_t = osmflat_ext::taginfo::ValueTallies::default();
+                for v in k.values() {
+                    let vn = query::intersect_bbox(v.nodes(), &nr).count() as u64;
+                    let vw = query::intersect_bbox(v.ways(), &wr).count() as u64;
+                    let vr = query::intersect_bbox(v.relations(), &rr).count() as u64;
+                    want_t.nodes += (vn > 0) as u64;
+                    want_t.ways += (vw > 0) as u64;
+                    want_t.relations += (vr > 0) as u64;
+                    want_t.any += (vn + vw + vr > 0) as u64;
+                    n += vn;
+                    w += vw;
+                    r += vr;
+                }
+
+                let got = k.counts_within(&nr, &wr, &rr);
+                assert_eq!(
+                    (got.nodes, got.ways, got.relations),
+                    (n, w, r),
+                    "{key} in {b:?}"
+                );
+                assert_eq!(
+                    k.value_tallies_within(&nr, &wr, &rr),
+                    want_t,
+                    "{key} in {b:?}"
+                );
+                saw_nonzero |= n + w + r > 0;
+            }
+        }
+    }
+    // Guard against the whole test passing on all-zero counts.
+    assert!(saw_nonzero, "fixture produced no in-bbox matches");
+}
+
+/// A box covering everything must reproduce the archive-wide aggregates.
+#[test]
+fn counts_within_covering_box_equals_stored_totals() {
+    let archive = full(None);
+    let taginfo = archive.taginfo().unwrap();
+    let b = Bbox {
+        min_lon: -180.0,
+        min_lat: -90.0,
+        max_lon: 180.0,
+        max_lat: 90.0,
+    };
+    let nr = query::to_index_ranges(&query::node_indices_in_bbox(archive.parent(), b));
+    let wr = query::to_index_ranges(&query::way_indices_in_bbox(archive.parent(), b));
+    let rr = query::to_index_ranges(&query::relation_indices_in_bbox(archive.parent(), b));
+
+    for key in ["name", "amenity", "highway", "type"] {
+        let k = taginfo.key(key.as_bytes()).unwrap();
+        assert_eq!(k.counts_within(&nr, &wr, &rr), k.counts(), "{key} counts");
+        let t = k.value_tallies_within(&nr, &wr, &rr);
+        assert_eq!(t.any, k.distinct_values(), "{key} distinct values");
+        // Per-type tallies must also match a full scan of the key's values.
+        let (mut vn, mut vw, mut vr) = (0u64, 0u64, 0u64);
+        for v in k.values() {
+            vn += !v.nodes().is_empty() as u64;
+            vw += !v.ways().is_empty() as u64;
+            vr += !v.relations().is_empty() as u64;
+        }
+        assert_eq!(
+            (t.nodes, t.ways, t.relations),
+            (vn, vw, vr),
+            "{key} per-type tallies"
+        );
+    }
+}
