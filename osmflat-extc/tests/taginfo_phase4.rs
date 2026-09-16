@@ -407,14 +407,16 @@ fn counts_within_match_per_value_clip() {
                 let k = taginfo.key(key.as_bytes()).unwrap();
 
                 // The per-value sum this replaces.
-                let (mut n, mut w, mut r, mut distinct) = (0u64, 0u64, 0u64, 0u64);
+                let (mut n, mut w, mut r) = (0u64, 0u64, 0u64);
+                let mut want_t = osmflat_ext::taginfo::ValueTallies::default();
                 for v in k.values() {
                     let vn = query::intersect_bbox(v.nodes(), &nr).count() as u64;
                     let vw = query::intersect_bbox(v.ways(), &wr).count() as u64;
                     let vr = query::intersect_bbox(v.relations(), &rr).count() as u64;
-                    if vn + vw + vr > 0 {
-                        distinct += 1;
-                    }
+                    want_t.nodes += (vn > 0) as u64;
+                    want_t.ways += (vw > 0) as u64;
+                    want_t.relations += (vr > 0) as u64;
+                    want_t.any += (vn + vw + vr > 0) as u64;
                     n += vn;
                     w += vw;
                     r += vr;
@@ -427,8 +429,8 @@ fn counts_within_match_per_value_clip() {
                     "{key} in {b:?}"
                 );
                 assert_eq!(
-                    k.distinct_values_within(&nr, &wr, &rr),
-                    distinct,
+                    k.value_tallies_within(&nr, &wr, &rr),
+                    want_t,
                     "{key} in {b:?}"
                 );
                 saw_nonzero |= n + w + r > 0;
@@ -457,10 +459,19 @@ fn counts_within_covering_box_equals_stored_totals() {
     for key in ["name", "amenity", "highway", "type"] {
         let k = taginfo.key(key.as_bytes()).unwrap();
         assert_eq!(k.counts_within(&nr, &wr, &rr), k.counts(), "{key} counts");
+        let t = k.value_tallies_within(&nr, &wr, &rr);
+        assert_eq!(t.any, k.distinct_values(), "{key} distinct values");
+        // Per-type tallies must also match a full scan of the key's values.
+        let (mut vn, mut vw, mut vr) = (0u64, 0u64, 0u64);
+        for v in k.values() {
+            vn += !v.nodes().is_empty() as u64;
+            vw += !v.ways().is_empty() as u64;
+            vr += !v.relations().is_empty() as u64;
+        }
         assert_eq!(
-            k.distinct_values_within(&nr, &wr, &rr),
-            k.distinct_values(),
-            "{key} distinct values"
+            (t.nodes, t.ways, t.relations),
+            (vn, vw, vr),
+            "{key} per-type tallies"
         );
     }
 }

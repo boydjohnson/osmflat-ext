@@ -246,13 +246,17 @@ impl<'a> Selection<'a> {
 /// The postings in `postings` that fall in the ascending, disjoint `ranges`,
 /// ascending.
 ///
+/// Prefer this to [`intersect_bbox`] when the ranges are many: that one visits
+/// every range with two binary searches, so it costs `O(R·log k)` even when the
+/// postings are few and miss the box entirely.
+///
 /// Leapfrogs instead of scanning: a posting before the current range jumps
 /// (binary search) to the range's start, and a range ending before the current
 /// posting jumps to the first range that could hold it. Each jump that yields
 /// nothing skips a whole range or a whole gap of postings, so the cost is about
 /// `O(min(k, R) · log)` plus the output, whichever of the postings or the
 /// ranges is sparser.
-pub(crate) fn clip_postings<'a>(
+pub fn clip_postings<'a>(
     postings: &'a [Ref],
     ranges: &'a [Range<u64>],
 ) -> impl Iterator<Item = u64> + 'a {

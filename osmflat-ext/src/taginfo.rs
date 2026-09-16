@@ -23,6 +23,18 @@ fn value_postings<'a>(entity: EntityType) -> fn(&ValueView<'a>) -> &'a [Ref] {
     }
 }
 
+/// Distinct-value tallies for one key, restricted to a set of ranges.
+///
+/// `any` counts values present in *any* type; since a value can occur on more
+/// than one entity type, it is not the sum of the per-type fields.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ValueTallies {
+    pub any: u64,
+    pub nodes: u64,
+    pub ways: u64,
+    pub relations: u64,
+}
+
 /// Object counts split by entity type.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TypeCounts {
@@ -349,31 +361,39 @@ impl<'a> KeyView<'a> {
         }
     }
 
-    /// How many of this key's values occur at least once inside `ranges`.
+    /// How many of this key's values occur at least once inside `ranges` --
+    /// overall and per entity type. A value can be present in more than one
+    /// type, so `any` is not the sum of the three.
     ///
     /// Unavoidably `O(values)` -- which value an object carries isn't
     /// recoverable from the `key=*` postings -- but each value only has to
     /// prove *existence*, so it stops at the first hit instead of counting
-    /// every match the way [`Self::counts_within`] must.
-    pub fn distinct_values_within(
+    /// every match the way [`Self::counts_within`] must. That is what separates
+    /// it from clipping each value: [`crate::query::clip_postings`] leapfrogs
+    /// out of a value that misses the box, rather than visiting every range.
+    pub fn value_tallies_within(
         &self,
         node_ranges: &[std::ops::Range<u64>],
         way_ranges: &[std::ops::Range<u64>],
         relation_ranges: &[std::ops::Range<u64>],
-    ) -> u64 {
-        self.values()
-            .filter(|v| {
-                crate::query::clip_postings(v.nodes(), node_ranges)
-                    .next()
-                    .is_some()
-                    || crate::query::clip_postings(v.ways(), way_ranges)
-                        .next()
-                        .is_some()
-                    || crate::query::clip_postings(v.relations(), relation_ranges)
-                        .next()
-                        .is_some()
-            })
-            .count() as u64
+    ) -> ValueTallies {
+        let mut t = ValueTallies::default();
+        for v in self.values() {
+            let n = crate::query::clip_postings(v.nodes(), node_ranges)
+                .next()
+                .is_some();
+            let w = crate::query::clip_postings(v.ways(), way_ranges)
+                .next()
+                .is_some();
+            let r = crate::query::clip_postings(v.relations(), relation_ranges)
+                .next()
+                .is_some();
+            t.nodes += n as u64;
+            t.ways += w as u64;
+            t.relations += r as u64;
+            t.any += (n || w || r) as u64;
+        }
+        t
     }
 
     /// `key=*` count for `entity` inside `ranges`, without materializing the
