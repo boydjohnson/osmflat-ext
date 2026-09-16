@@ -1,0 +1,121 @@
+name: release
+
+# Tagging `v*` publishes a release. `workflow_dispatch` builds the same matrix
+# without publishing, which is the only way to find out that a target broke
+# before a tag is already cut and public.
+#
+# Same two targets osmflat-rs ships, for the same reason: osmflat-extc consumes
+# archives osmflatc produces, so shipping it somewhere osmflatc can't run would
+# be of no use.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      publish:
+        description: "Publish a GitHub release (off = build and upload artifacts only)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      # One target failing shouldn't hide whether the other is healthy.
+      fail-fast: false
+      matrix:
+        include:
+          # 22.04, not latest: the binary links against the runner's glibc, and
+          # building on 24.04 (glibc 2.39) yields something that won't start on
+          # any older distro. The oldest runner we build on sets the floor.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-apple-darwin
+            os: macos-14
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      # --locked: a published binary should be built from the dependency graph
+      # recorded in the tag, not whatever resolved that morning. It matters more
+      # here than most places -- `osmflat` is tracked by branch, so without the
+      # lock this would float with whatever osmflat-rs main points at.
+      - name: Build
+        run: cargo build --locked --profile dist -p osmflat-extc --target ${{ matrix.target }}
+
+      # Catches a binary that built but can't run.
+      - name: Smoke test
+        run: |
+          bin="target/${{ matrix.target }}/dist/osmflat-extc"
+          "$bin" --version
+          "$bin" --help > /dev/null
+
+      - name: Package
+        id: package
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="osmflat-extc"))')"
+          name="osmflat-extc-${version}-${{ matrix.target }}"
+          mkdir -p "dist/$name"
+          cp "target/${{ matrix.target }}/dist/osmflat-extc" "dist/$name/"
+          cp LICENSE-APACHE LICENSE-MIT README.md "dist/$name/"
+          cd dist
+          tar czf "$name.tar.gz" "$name"
+          echo "asset=$name.tar.gz" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: dist/${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    # Only a tag publishes. A dispatch run stops after `build`, leaving the
+    # artifacts downloadable from the run for inspection.
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # One checksum file over every archive, so a download can be verified
+      # without trusting the transport.
+      - name: Checksums
+        run: |
+          cd artifacts
+          sha256sum * > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF_NAME}"
+          gh release create "$tag" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "$tag" \
+            --generate-notes \
+            artifacts/*
