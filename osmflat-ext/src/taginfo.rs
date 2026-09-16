@@ -425,12 +425,14 @@ impl<'a> KeyView<'a> {
             .chain(merged.into_iter().flatten())
     }
 
-    /// `key=*` for `entity`, restricted to the ascending, disjoint `ranges`.
-    pub(crate) fn postings_within(
-        &self,
-        entity: EntityType,
-        ranges: &[std::ops::Range<u64>],
-    ) -> Vec<u64> {
+    /// `key=*` entity indices inside the ascending, disjoint `ranges`,
+    /// ascending and deduplicated.
+    ///
+    /// The counting counterpart is [`Self::counts_within`]; use this when the
+    /// indices themselves are needed, e.g. to intersect two keys' in-box object
+    /// sets. Same reason it takes prepared ranges rather than a bbox: a caller
+    /// comparing one key against thousands of others resolves the box once.
+    pub fn postings_within(&self, entity: EntityType, ranges: &[std::ops::Range<u64>]) -> Vec<u64> {
         if let Some(stored) = self.stored_postings(entity) {
             return crate::query::clip_postings(stored, ranges).collect();
         }
