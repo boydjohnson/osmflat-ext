@@ -324,6 +324,72 @@ impl<'a> KeyView<'a> {
         self.postings_within(EntityType::Relation, &crate::query::to_index_ranges(&idx))
     }
 
+    /// Per-type `key=*` counts restricted to precomputed, ascending, disjoint
+    /// entity-index ranges (build them once with
+    /// [`crate::query::node_indices_in_bbox`] + [`crate::query::to_index_ranges`]).
+    ///
+    /// The `*_in_bbox` methods each resolve the bbox themselves, which is the
+    /// wrong shape for a caller that sweeps many keys against one box: the
+    /// spatial query would be repeated per key. This takes the ranges already
+    /// built, so that cost is paid once for the whole sweep.
+    ///
+    /// With stored key postings this is one leapfrogging clip per entity type,
+    /// independent of how many distinct values the key has -- the difference
+    /// between `O(1)` and `O(values)` clips for keys like `addr:street`.
+    pub fn counts_within(
+        &self,
+        node_ranges: &[std::ops::Range<u64>],
+        way_ranges: &[std::ops::Range<u64>],
+        relation_ranges: &[std::ops::Range<u64>],
+    ) -> TypeCounts {
+        TypeCounts {
+            nodes: self.count_within(EntityType::Node, node_ranges),
+            ways: self.count_within(EntityType::Way, way_ranges),
+            relations: self.count_within(EntityType::Relation, relation_ranges),
+        }
+    }
+
+    /// How many of this key's values occur at least once inside `ranges`.
+    ///
+    /// Unavoidably `O(values)` -- which value an object carries isn't
+    /// recoverable from the `key=*` postings -- but each value only has to
+    /// prove *existence*, so it stops at the first hit instead of counting
+    /// every match the way [`Self::counts_within`] must.
+    pub fn distinct_values_within(
+        &self,
+        node_ranges: &[std::ops::Range<u64>],
+        way_ranges: &[std::ops::Range<u64>],
+        relation_ranges: &[std::ops::Range<u64>],
+    ) -> u64 {
+        self.values()
+            .filter(|v| {
+                crate::query::clip_postings(v.nodes(), node_ranges)
+                    .next()
+                    .is_some()
+                    || crate::query::clip_postings(v.ways(), way_ranges)
+                        .next()
+                        .is_some()
+                    || crate::query::clip_postings(v.relations(), relation_ranges)
+                        .next()
+                        .is_some()
+            })
+            .count() as u64
+    }
+
+    /// `key=*` count for `entity` inside `ranges`, without materializing the
+    /// postings. Falls back to per-value clips when the sidecar has no stored
+    /// key postings; a key's value postings are disjoint (an object carries one
+    /// value per key), so summing them needs no dedup.
+    fn count_within(&self, entity: EntityType, ranges: &[std::ops::Range<u64>]) -> u64 {
+        if let Some(stored) = self.stored_postings(entity) {
+            return crate::query::clip_postings(stored, ranges).count() as u64;
+        }
+        self.postings(value_postings(entity))
+            .into_iter()
+            .map(|p| crate::query::clip_postings(p, ranges).count() as u64)
+            .sum()
+    }
+
     /// `key=*` for `entity`, ascending: stored postings if present, else the
     /// merge of this key's value postings.
     pub(crate) fn postings_of(&self, entity: EntityType) -> impl Iterator<Item = u64> + 'a {
