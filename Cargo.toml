@@ -16,3 +16,9 @@ repository = "https://github.com/boydjohnson/osmflat-ext"
 # crate is designed against.
 osmflat = { git = "https://github.com/boydjohnson/osmflat-rs", branch = "main" }
 flatdata = "0.5.3"
+
+# What `release.yml` ships. Debug symbols are dead weight in a download, and
+# nothing here needs them at runtime.
+[profile.dist]
+inherits = "release"
+strip = "symbols"
