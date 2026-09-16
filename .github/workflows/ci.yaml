@@ -30,11 +30,14 @@ jobs:
       - name: Check formatting
         run: cargo fmt --all -- --check
 
+      # --locked everywhere: the lock is committed, so CI should build the
+      # graph it records and fail on a stale lock rather than quietly
+      # resolving to something newer.
       - name: Build crates
-        run: cargo build --workspace --all-features
+        run: cargo build --locked --workspace --all-features
 
       - name: Build examples
-        run: cargo build --workspace --examples --all-features
+        run: cargo build --locked --workspace --examples --all-features
 
       - name: Test workspace
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
