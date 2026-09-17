@@ -125,21 +125,6 @@ impl PairSink {
         Ok(())
     }
 
-    /// Append a batch of records, in order.
-    pub(crate) fn extend(&mut self, records: &[(u64, u64)]) -> Result<(), BuildError> {
-        match self {
-            PairSink::Ram(v) => v.extend_from_slice(records),
-            PairSink::File { writer, len } => {
-                for &(a, b) in records {
-                    writer.write_all(&a.to_le_bytes())?;
-                    writer.write_all(&b.to_le_bytes())?;
-                }
-                *len += records.len();
-            }
-        }
-        Ok(())
-    }
-
     /// Consume the sink and return all records, in insertion order.
     pub(crate) fn into_records(self) -> Result<Vec<(u64, u64)>, BuildError> {
         match self {
@@ -167,6 +152,84 @@ impl PairSink {
                     remaining -= n;
                 }
                 Ok(records)
+            }
+        }
+    }
+}
+
+/// Append-only sink of `u64` keys: a growable RAM buffer, or a sequential-write
+/// unnamed temp file in a scratch directory (8 little-endian bytes a key).
+/// Batches are encoded and written with a single `write_all`, so a writer
+/// sharing the sink behind a lock holds it for one syscall a batch.
+pub(crate) enum KeySink {
+    Ram(Vec<u64>),
+    File {
+        writer: BufWriter<File>,
+        len: usize,
+        encoded: Vec<u8>,
+    },
+}
+
+impl KeySink {
+    pub(crate) fn new(dir: Option<&Path>) -> Result<Self, BuildError> {
+        match dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                Ok(KeySink::File {
+                    writer: BufWriter::new(tempfile::tempfile_in(dir)?),
+                    len: 0,
+                    encoded: Vec::new(),
+                })
+            }
+            None => Ok(KeySink::Ram(Vec::new())),
+        }
+    }
+
+    /// Append a batch of keys, in order.
+    pub(crate) fn extend(&mut self, keys: &[u64]) -> Result<(), BuildError> {
+        match self {
+            KeySink::Ram(v) => v.extend_from_slice(keys),
+            KeySink::File {
+                writer,
+                len,
+                encoded,
+            } => {
+                encoded.clear();
+                encoded.extend(keys.iter().flat_map(|k| k.to_le_bytes()));
+                writer.write_all(encoded)?;
+                *len += keys.len();
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the sink and return all keys, in insertion order.
+    pub(crate) fn into_keys(self) -> Result<Vec<u64>, BuildError> {
+        match self {
+            KeySink::Ram(v) => Ok(v),
+            KeySink::File { writer, len, .. } => {
+                let mut file = writer.into_inner().map_err(|e| e.into_error())?;
+                file.seek(SeekFrom::Start(0))?;
+                // Decode through a bounded buffer rather than reading the
+                // whole file first, so a bucket never needs twice its size
+                // in RAM.
+                let mut keys = Vec::with_capacity(len);
+                let mut buf = vec![0u8; 8 * 128 * 1024];
+                let mut remaining = len;
+                while remaining > 0 {
+                    let n = remaining.min(buf.len() / 8);
+                    let chunk = &mut buf[..n * 8];
+                    file.read_exact(chunk)?;
+                    keys.extend(
+                        chunk
+                            .as_chunks::<8>()
+                            .0
+                            .iter()
+                            .map(|c| u64::from_le_bytes(*c)),
+                    );
+                    remaining -= n;
+                }
+                Ok(keys)
             }
         }
     }

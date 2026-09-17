@@ -9,8 +9,11 @@
 //!
 //! Each map is built by sorting its `(child, parent)` pairs. One pass over the
 //! parents appends every pair to one of several buckets, each covering a
-//! contiguous range of child indices; then the buckets are read back in child
-//! order, each sorted on its own, and streamed straight into the output CSR
+//! contiguous, power-of-two span of child indices. Within a bucket a pair
+//! packs into one `u64` key -- the child's offset in the span above the
+//! parent's bits -- so sorting keys sorts pairs. Then the buckets are read
+//! back in child order, each sorted on its own, and streamed straight into the
+//! output CSR
 //! (one `Range` per child, then its parents). Sorting by `(child, parent)`
 //! makes each child's postings run ascending == spatial (SFC) order, so
 //! backref results compose with bbox and tag selections. A parent that
@@ -28,7 +31,7 @@
 //! `--mmap-scratch` the buckets are temp files in that directory; without it
 //! they stay in RAM.
 
-use crate::scratch::PairSink;
+use crate::scratch::KeySink;
 use crate::{BuildError, BuildOptions};
 use osmflat::{Osm, RelationMembersRef};
 use osmflat_ext::{BackrefsBuilder, Range, Ref};
@@ -39,13 +42,13 @@ use std::sync::Mutex;
 use std::time::Instant;
 
 /// Pairs per bucket to aim for: a bucket is sorted in RAM, so this bounds each
-/// sort's working set (16 bytes a pair: ~256 MB). Up to one bucket per Rayon
+/// sort's working set (8 bytes a pair: ~128 MB). Up to one bucket per Rayon
 /// thread is held at once.
 const TARGET_PAIRS_PER_BUCKET: usize = 16 << 20;
 
 /// Pairs a collect worker buffers per bucket before appending them to the
-/// shared bucket sink under its lock.
-const LOCAL_BUFFER_PAIRS: usize = 4096;
+/// shared bucket sink under its lock, in one write.
+const LOCAL_BUFFER_PAIRS: usize = 16 << 10;
 
 /// Build and write the `Backrefs` sub-archive for `parent` into `builder`.
 pub fn build(
@@ -60,7 +63,7 @@ pub fn build(
 
     // node -> ways. Each way ref yields at most one pair.
     let mut phase_start = Instant::now();
-    let node_ways = PairBuckets::new(scratch, n_nodes, parent.nodes_index().len())?;
+    let node_ways = PairBuckets::new(scratch, n_nodes, n_ways, parent.nodes_index().len())?;
     collect_way_nodes(parent, &node_ways)?;
     eprintln!("[backrefs] node->ways collect: {:?}", phase_start.elapsed());
     phase_start = Instant::now();
@@ -77,9 +80,9 @@ pub fn build(
     // member yields at most one pair, in exactly one of the maps.
     phase_start = Instant::now();
     let n_members = parent.relation_members().len();
-    let mut rels_of_node = PairBuckets::new(scratch, n_nodes, n_members)?;
-    let mut rels_of_way = PairBuckets::new(scratch, n_ways, n_members)?;
-    let mut rels_of_rel = PairBuckets::new(scratch, n_rels, n_members)?;
+    let mut rels_of_node = PairBuckets::new(scratch, n_nodes, n_rels, n_members)?;
+    let mut rels_of_way = PairBuckets::new(scratch, n_ways, n_rels, n_members)?;
+    let mut rels_of_rel = PairBuckets::new(scratch, n_rels, n_rels, n_members)?;
     for_each_member(parent, |member, r| match member {
         Member::Node(n) => rels_of_node.push(n, r),
         Member::Way(w) => rels_of_way.push(w, r),
@@ -183,87 +186,118 @@ fn for_each_member(
     Ok(())
 }
 
-/// One reverse map's `(child, parent)` pairs, bucketed by contiguous child
-/// index range so that concatenating the sorted buckets in order yields every
-/// pair sorted by `(child, parent)`.
+/// One reverse map's `(child, parent)` pairs, bucketed by child index so that
+/// concatenating the sorted buckets in order yields every pair sorted by
+/// `(child, parent)`.
+///
+/// Bucket `b` holds children `b << span_bits .. (b + 1) << span_bits`, and a
+/// pair is stored as the key `(child - bucket start) << parent_bits | parent`.
+/// `span_bits + parent_bits <= 64`, so the key is exact, and within a bucket
+/// key order is `(child, parent)` order.
 struct PairBuckets {
-    buckets: Vec<Mutex<PairSink>>,
+    buckets: Vec<Mutex<KeySink>>,
     n_children: u64,
+    span_bits: u32,
+    parent_bits: u32,
 }
 
 impl PairBuckets {
-    /// Buckets for up to `max_pairs` pairs over children `0..n_children`.
-    fn new(dir: Option<&Path>, n_children: usize, max_pairs: usize) -> Result<Self, BuildError> {
-        let n_buckets = max_pairs
-            .div_ceil(TARGET_PAIRS_PER_BUCKET)
-            .clamp(1, n_children.max(1));
+    /// Buckets for up to `max_pairs` pairs over children `0..n_children` and
+    /// parents `0..n_parents`.
+    fn new(
+        dir: Option<&Path>,
+        n_children: usize,
+        n_parents: usize,
+        max_pairs: usize,
+    ) -> Result<Self, BuildError> {
+        let parent_bits = u64::BITS - (n_parents.saturating_sub(1) as u64).leading_zeros();
+        // Aim for `TARGET_PAIRS_PER_BUCKET`, rounding the span up to a power of
+        // two, but never so wide that a child offset overflows its bits.
+        let want_buckets = max_pairs.div_ceil(TARGET_PAIRS_PER_BUCKET).max(1);
+        let want_span = n_children.div_ceil(want_buckets).max(1) as u64;
+        let span_bits = (u64::BITS - (want_span - 1).leading_zeros())
+            .min(u64::BITS - parent_bits)
+            .min(u64::BITS - 1);
+        let n_buckets = ((n_children as u64).div_ceil(1 << span_bits)).max(1);
         let buckets = (0..n_buckets)
-            .map(|_| PairSink::new(dir).map(Mutex::new))
+            .map(|_| KeySink::new(dir).map(Mutex::new))
             .collect::<Result<_, _>>()?;
         Ok(PairBuckets {
             buckets,
             n_children: n_children as u64,
+            span_bits,
+            parent_bits,
         })
     }
 
-    /// The bucket holding `child`. Children are spread evenly across buckets
-    /// by index; `u128` keeps `child * n_buckets` from overflowing.
-    fn bucket_of(&self, child: u64) -> usize {
-        (child as u128 * self.buckets.len() as u128 / self.n_children as u128) as usize
+    /// The bucket holding `child`, and the pair's key within it.
+    fn locate(&self, child: u64, parent: u64) -> (usize, u64) {
+        let offset = child & ((1u64 << self.span_bits) - 1);
+        let key = (offset << self.parent_bits) | parent;
+        ((child >> self.span_bits) as usize, key)
+    }
+
+    /// Recover the pair from bucket `bucket`'s `key`.
+    fn decode(&self, bucket: usize, key: u64) -> (u64, u64) {
+        let offset = key >> self.parent_bits;
+        let parent = key & ((1u64 << self.parent_bits) - 1);
+        (((bucket as u64) << self.span_bits) | offset, parent)
     }
 
     /// Push one pair from a single-threaded collect pass.
     fn push(&mut self, child: u64, parent: u64) -> Result<(), BuildError> {
-        let bucket = self.bucket_of(child);
+        let (bucket, key) = self.locate(child, parent);
         self.buckets[bucket]
             .get_mut()
             .expect("bucket lock poisoned")
-            .push(child, parent)
+            .extend(&[key])
     }
 
     /// Stream the map out as a CSR pair: one `Range` per child (plus the
     /// trailing sentinel flatdata trims on read) whose `post()` slices the
     /// flattened parents.
     fn write_csr(
-        self,
+        mut self,
         mut ranges: flatdata::ExternalVector<Range>,
         mut posts: flatdata::ExternalVector<Ref>,
     ) -> Result<(), BuildError> {
         let mut next_child = 0u64;
         let mut written = 0u64;
         let window = rayon::current_num_threads();
-        let mut buckets = self
-            .buckets
+        let n_buckets = self.buckets.len();
+        let mut buckets = std::mem::take(&mut self.buckets)
             .into_iter()
             .map(|b| b.into_inner().expect("bucket lock poisoned"));
-        loop {
+        let mut bucket_idx = 0;
+        while bucket_idx < n_buckets {
             // Read back and sort the next window of buckets in parallel, then
             // write them out in bucket order. `par_sort_unstable` also
             // parallelizes a lone bucket, the common case for the small
             // relation maps.
-            let sorted: Vec<Vec<(u64, u64)>> = buckets
+            let sorted: Vec<Vec<u64>> = buckets
                 .by_ref()
                 .take(window)
                 .collect::<Vec<_>>()
                 .into_par_iter()
                 .map(|bucket| {
-                    let mut pairs = bucket.into_records()?;
-                    pairs.par_sort_unstable();
-                    Ok(pairs)
+                    let mut keys = bucket.into_keys()?;
+                    keys.par_sort_unstable();
+                    Ok(keys)
                 })
                 .collect::<Result<_, BuildError>>()?;
-            if sorted.is_empty() {
-                break;
-            }
-            for (child, parent) in sorted.into_iter().flatten() {
-                // Open the ranges of every child up to this one; children
-                // with no parents get empty ranges.
-                while next_child <= child {
-                    ranges.grow()?.set_first_idx(written);
-                    next_child += 1;
+            for keys in sorted {
+                for key in keys {
+                    let (child, parent) = self.decode(bucket_idx, key);
+                    // Open the ranges of every child up to this one; children
+                    // with no parents get empty ranges.
+                    while next_child <= child {
+                        ranges.grow()?.set_first_idx(written);
+                        next_child += 1;
+                    }
+                    posts.grow()?.set_value(parent);
+                    written += 1;
                 }
-                posts.grow()?.set_value(parent);
-                written += 1;
+                bucket_idx += 1;
             }
         }
         // The remaining children, then the sentinel at index `n_children`.
@@ -277,12 +311,12 @@ impl PairBuckets {
     }
 }
 
-/// A collect worker's per-bucket buffers over shared [`PairBuckets`]: pairs
-/// are batched locally and appended under a bucket's lock only when its
-/// buffer fills, so workers rarely contend.
+/// A collect worker's per-bucket buffers over shared [`PairBuckets`]: keys are
+/// batched locally and appended under a bucket's lock only when its buffer
+/// fills, so workers rarely contend.
 struct LocalPairs<'a> {
     buckets: &'a PairBuckets,
-    buffers: Vec<Vec<(u64, u64)>>,
+    buffers: Vec<Vec<u64>>,
 }
 
 impl<'a> LocalPairs<'a> {
@@ -294,16 +328,16 @@ impl<'a> LocalPairs<'a> {
     }
 
     fn push(&mut self, child: u64, parent: u64) -> Result<(), BuildError> {
-        let bucket = self.buckets.bucket_of(child);
+        let (bucket, key) = self.buckets.locate(child, parent);
         let buffer = &mut self.buffers[bucket];
-        buffer.push((child, parent));
+        buffer.push(key);
         if buffer.len() >= LOCAL_BUFFER_PAIRS {
             Self::append(&self.buckets.buckets[bucket], buffer)?;
         }
         Ok(())
     }
 
-    /// Append every buffered pair. Must be called when the worker finishes.
+    /// Append every buffered key. Must be called when the worker finishes.
     fn flush(mut self) -> Result<(), BuildError> {
         for (bucket, buffer) in self.buckets.buckets.iter().zip(&mut self.buffers) {
             Self::append(bucket, buffer)?;
@@ -311,7 +345,7 @@ impl<'a> LocalPairs<'a> {
         Ok(())
     }
 
-    fn append(bucket: &Mutex<PairSink>, buffer: &mut Vec<(u64, u64)>) -> Result<(), BuildError> {
+    fn append(bucket: &Mutex<KeySink>, buffer: &mut Vec<u64>) -> Result<(), BuildError> {
         if !buffer.is_empty() {
             bucket
                 .lock()
@@ -320,5 +354,50 @@ impl<'a> LocalPairs<'a> {
             buffer.clear();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PairBuckets;
+
+    /// Keys round-trip to their pairs, land in the bucket covering the child,
+    /// and sort in `(child, parent)` order within a bucket, across edge cases
+    /// for the bit split.
+    #[test]
+    fn pair_keys_round_trip_and_sort() {
+        for (n_children, n_parents, max_pairs) in [
+            (1, 1, 1),
+            (0, 0, 0),
+            (10, 1, 10),
+            (1000, 2, 5000),
+            (1 << 20, 1 << 16, 1 << 24),
+            ((1 << 20) + 1, (1 << 16) + 1, 1 << 26),
+            (1 << 40, 1 << 30, 1 << 36),
+        ] {
+            let buckets = PairBuckets::new(None, n_children, n_parents, max_pairs).unwrap();
+            assert!(buckets.span_bits + buckets.parent_bits <= u64::BITS);
+            let n_buckets = buckets.buckets.len() as u64;
+            assert!(n_buckets << buckets.span_bits >= n_children as u64);
+
+            let last_child = (n_children as u64).saturating_sub(1);
+            let last_parent = (n_parents as u64).saturating_sub(1);
+            let mut pairs = vec![(0, 0), (0, last_parent), (last_child, 0)];
+            pairs.push((last_child, last_parent));
+            pairs.push((last_child / 2, last_parent / 2));
+            pairs.push((last_child / 2, last_parent / 2 + last_parent % 2));
+            for &(child, parent) in &pairs {
+                let (bucket, key) = buckets.locate(child, parent);
+                assert!((bucket as u64) < n_buckets);
+                assert_eq!(buckets.decode(bucket, key), (child, parent));
+            }
+
+            let mut located: Vec<_> = pairs.iter().map(|&(c, p)| buckets.locate(c, p)).collect();
+            located.sort_unstable();
+            let decoded: Vec<_> = located.iter().map(|&(b, k)| buckets.decode(b, k)).collect();
+            let mut expected = pairs.clone();
+            expected.sort_unstable();
+            assert_eq!(decoded, expected);
+        }
     }
 }
