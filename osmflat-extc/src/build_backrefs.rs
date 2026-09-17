@@ -21,18 +21,23 @@
 //! This replaces a count-then-fill CSR, which needed several child-sized
 //! offset and cursor arrays (5+ GB each for a continent's nodes) written at
 //! scattered positions -- page-fault thrashing once they no longer fit in
-//! RAM. Bucket appends are sequential, only one bucket is ever held in RAM
-//! while sorting, and the output is written in order. With `--mmap-scratch`
-//! the buckets are temp files in that directory; without it they stay in RAM.
+//! RAM. Bucket appends are sequential, and the output is written in order.
+//! Buckets are sorted in parallel, one window of as many buckets as Rayon has
+//! threads at a time, so at most that many buckets are in RAM at once. With
+//! `--mmap-scratch` the buckets are temp files in that directory; without it
+//! they stay in RAM.
 
 use crate::scratch::PairSink;
 use crate::{BuildError, BuildOptions};
 use osmflat::{Osm, RelationMembersRef};
 use osmflat_ext::{BackrefsBuilder, Range, Ref};
+use rayon::prelude::*;
 use std::path::Path;
+use std::time::Instant;
 
-/// Pairs per bucket to aim for: a bucket is sorted in RAM, so this bounds the
-/// sort's working set (16 bytes a pair: ~256 MB).
+/// Pairs per bucket to aim for: a bucket is sorted in RAM, so this bounds each
+/// sort's working set (16 bytes a pair: ~256 MB). Up to one bucket per Rayon
+/// thread is held at once.
 const TARGET_PAIRS_PER_BUCKET: usize = 16 << 20;
 
 /// Build and write the `Backrefs` sub-archive for `parent` into `builder`.
@@ -47,15 +52,23 @@ pub fn build(
     let n_rels = parent.relations().len();
 
     // node -> ways. Each way ref yields at most one pair.
+    let mut phase_start = Instant::now();
     let mut node_ways = PairBuckets::new(scratch, n_nodes, parent.nodes_index().len())?;
     for_each_way_node(parent, |n, w| node_ways.push(n, w))?;
+    eprintln!("[backrefs] node->ways collect: {:?}", phase_start.elapsed());
+    phase_start = Instant::now();
     node_ways.write_csr(
         builder.start_node_ways_range()?,
         builder.start_ways_of_node()?,
     )?;
+    eprintln!(
+        "[backrefs] node->ways sort + write: {:?}",
+        phase_start.elapsed()
+    );
 
     // node/way/relation -> relations: the three maps share one pass. Each
     // member yields at most one pair, in exactly one of the maps.
+    phase_start = Instant::now();
     let n_members = parent.relation_members().len();
     let mut rels_of_node = PairBuckets::new(scratch, n_nodes, n_members)?;
     let mut rels_of_way = PairBuckets::new(scratch, n_ways, n_members)?;
@@ -65,6 +78,11 @@ pub fn build(
         Member::Way(w) => rels_of_way.push(w, r),
         Member::Relation(rr) => rels_of_rel.push(rr, r),
     })?;
+    eprintln!(
+        "[backrefs] X->relations collect: {:?}",
+        phase_start.elapsed()
+    );
+    phase_start = Instant::now();
     rels_of_node.write_csr(
         builder.start_node_rels_range()?,
         builder.start_rels_of_node()?,
@@ -77,6 +95,10 @@ pub fn build(
         builder.start_rel_rels_range()?,
         builder.start_rels_of_rel()?,
     )?;
+    eprintln!(
+        "[backrefs] X->relations sort + write: {:?}",
+        phase_start.elapsed()
+    );
     Ok(())
 }
 
@@ -182,10 +204,28 @@ impl PairBuckets {
     ) -> Result<(), BuildError> {
         let mut next_child = 0u64;
         let mut written = 0u64;
-        for bucket in self.buckets {
-            let mut pairs = bucket.into_records()?;
-            pairs.sort_unstable();
-            for (child, parent) in pairs {
+        let window = rayon::current_num_threads();
+        let mut buckets = self.buckets.into_iter();
+        loop {
+            // Read back and sort the next window of buckets in parallel, then
+            // write them out in bucket order. `par_sort_unstable` also
+            // parallelizes a lone bucket, the common case for the small
+            // relation maps.
+            let sorted: Vec<Vec<(u64, u64)>> = buckets
+                .by_ref()
+                .take(window)
+                .collect::<Vec<_>>()
+                .into_par_iter()
+                .map(|bucket| {
+                    let mut pairs = bucket.into_records()?;
+                    pairs.par_sort_unstable();
+                    Ok(pairs)
+                })
+                .collect::<Result<_, BuildError>>()?;
+            if sorted.is_empty() {
+                break;
+            }
+            for (child, parent) in sorted.into_iter().flatten() {
                 // Open the ranges of every child up to this one; children
                 // with no parents get empty ranges.
                 while next_child <= child {
