@@ -76,11 +76,11 @@ osmflat-ext/              lib: reader bindings + query API
 osmflat-extc/             bin+lib: the compiler that builds sidecars
   src/main.rs               CLI
   src/build_taginfo.rs      count-then-fill CSR (dictionary, count, fill) + key postings + trigram index
-  src/build_backrefs.rs     2 CSR builds (node->ways, X->relations)
+  src/build_backrefs.rs     bucketed parallel sorts (node->ways, X->relations)
   src/build_multipolygons.rs  relation ring assembly
   src/build_coastline.rs    global coastline ring assembly
   src/build_land_polygons.rs  shapefile import, reprojected to WGS84
-  src/scratch.rs            RAM- or mmap-backed scratch arrays (--mmap-scratch)
+  src/scratch.rs            RAM- or mmap-backed scratch arrays and bucket sinks (--mmap-scratch)
   src/test_support.rs       synthetic parent + sidecar fixtures (feature test-support)
   tests/                    brute-force oracle tests for every sub-archive and query
 ```

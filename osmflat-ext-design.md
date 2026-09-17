@@ -482,19 +482,27 @@ per key, and `--value-search` runs its own count-then-fill over value strings
 
 Four reverse maps (node→ways from `nodes_index`; node/way/relation→relations
 from `relation_members`), each built by sorting its `(child, parent)` pairs
-rather than by count-then-fill. One pass over the parents appends each pair to
-one of several buckets covering contiguous child-index ranges (about 16 M
-pairs per bucket; temp files under `--mmap-scratch`, RAM otherwise). The
-buckets are then read back in order, each sorted in RAM, and streamed straight
-into the output `Range`/`Ref` vectors. Sorting by `(child, parent)` keeps each
-child's postings ascending, as in 6.2.
+rather than by count-then-fill.
+
+1. **Collect.** One pass over the parents appends each pair to one of several
+   buckets, each covering a power-of-two span of child indices (sized for about
+   16 M pairs; temp files under `--mmap-scratch`, RAM otherwise). Within a
+   bucket a pair is one `u64` key, `(child offset << parent_bits) | parent`;
+   the span is capped so the key always fits. For node→ways the ways are split
+   into ranges collected in parallel: each worker buffers keys per bucket and
+   appends a full buffer under the bucket's lock with a single write.
+2. **Sort and write.** Buckets are read back in windows of one per Rayon
+   thread, sorted in parallel, and streamed in bucket order straight into the
+   output `Range`/`Ref` vectors. Key order is `(child, parent)` order, so each
+   child's postings stay ascending, as in 6.2.
 
 A count-then-fill build needs child-sized offset and cursor arrays per map —
 about 5 GB each for a continent's nodes, even for node→relations where few
 nodes have any — written at scattered positions. On a South America parent
 that meant ~27 GB of mmap scratch on a 16 GB laptop and a build dominated by
-page faults. The bucketed sort only ever holds one bucket in RAM, and all of
-its writes are sequential.
+page faults (235.7 s, 112 s of it in the kernel). The bucketed sort holds at
+most one window of buckets in RAM and all of its writes are sequential; the
+same build takes 23.3 s.
 
 ### 6.4 Memory / scratch budget
 
@@ -512,7 +520,7 @@ Build-time structures, as implemented (`T` = tag references =
 | trigram postings | Σ distinct trigrams per value × 8 B | value search | `Scratch` |
 | tag-pair mentions (`--combinations`) | Σ pairs × 16 B | combinations | sequential bucket files |
 | key-pair counts, per-tag combo lists | see §10 limitation 4 | combinations | RAM |
-| backref `(child, parent)` pairs | ~(`nodes_index` + Σ members) × 16 B | backrefs | sequential bucket files; one bucket in RAM while sorted |
+| backref `(child, parent)` keys | ~(`nodes_index` + Σ members) × 8 B | backrefs | sequential bucket files; one bucket per thread in RAM while sorted |
 
 ### 6.5 Measured: United States extract
 
