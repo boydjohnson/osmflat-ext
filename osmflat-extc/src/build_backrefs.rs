@@ -22,8 +22,9 @@
 //! offset and cursor arrays (5+ GB each for a continent's nodes) written at
 //! scattered positions -- page-fault thrashing once they no longer fit in
 //! RAM. Bucket appends are sequential, and the output is written in order.
-//! Buckets are sorted in parallel, one window of as many buckets as Rayon has
-//! threads at a time, so at most that many buckets are in RAM at once. With
+//! The node->ways pairs are collected in parallel over way ranges, and buckets
+//! are sorted in parallel, one window of as many buckets as Rayon has threads
+//! at a time, so at most that many buckets are in RAM at once. With
 //! `--mmap-scratch` the buckets are temp files in that directory; without it
 //! they stay in RAM.
 
@@ -32,13 +33,19 @@ use crate::{BuildError, BuildOptions};
 use osmflat::{Osm, RelationMembersRef};
 use osmflat_ext::{BackrefsBuilder, Range, Ref};
 use rayon::prelude::*;
+use std::ops::Range as IndexRange;
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::Instant;
 
 /// Pairs per bucket to aim for: a bucket is sorted in RAM, so this bounds each
 /// sort's working set (16 bytes a pair: ~256 MB). Up to one bucket per Rayon
 /// thread is held at once.
 const TARGET_PAIRS_PER_BUCKET: usize = 16 << 20;
+
+/// Pairs a collect worker buffers per bucket before appending them to the
+/// shared bucket sink under its lock.
+const LOCAL_BUFFER_PAIRS: usize = 4096;
 
 /// Build and write the `Backrefs` sub-archive for `parent` into `builder`.
 pub fn build(
@@ -53,8 +60,8 @@ pub fn build(
 
     // node -> ways. Each way ref yields at most one pair.
     let mut phase_start = Instant::now();
-    let mut node_ways = PairBuckets::new(scratch, n_nodes, parent.nodes_index().len())?;
-    for_each_way_node(parent, |n, w| node_ways.push(n, w))?;
+    let node_ways = PairBuckets::new(scratch, n_nodes, parent.nodes_index().len())?;
+    collect_way_nodes(parent, &node_ways)?;
     eprintln!("[backrefs] node->ways collect: {:?}", phase_start.elapsed());
     phase_start = Instant::now();
     node_ways.write_csr(
@@ -109,23 +116,36 @@ enum Member {
     Relation(u64),
 }
 
-/// Visit each distinct (node, way) pair, ways in index order.
-fn for_each_way_node(
-    parent: &Osm,
-    mut visit: impl FnMut(u64, u64) -> Result<(), BuildError>,
-) -> Result<(), BuildError> {
+/// Push each distinct (node, way) pair into `buckets`. Ways are split into
+/// contiguous index ranges collected in parallel; pairs reach a bucket in no
+/// particular order, which is fine since each bucket is sorted before it is
+/// written.
+fn collect_way_nodes(parent: &Osm, buckets: &PairBuckets) -> Result<(), BuildError> {
     let nodes_index = parent.nodes_index();
-    let mut nodes = Vec::new();
-    for (w, way) in parent.ways().iter().enumerate() {
-        nodes.clear();
-        nodes.extend(way.refs().filter_map(|ri| nodes_index[ri as usize].value()));
-        nodes.sort_unstable();
-        nodes.dedup();
-        for &n in &nodes {
-            visit(n, w as u64)?;
+    let ways = parent.ways();
+    // Several ranges per thread, so a dense range doesn't leave threads idle.
+    let n_ranges = (rayon::current_num_threads() * 8).min(ways.len().max(1));
+    let ranges: Vec<IndexRange<usize>> = (0..n_ranges)
+        .map(|i| i * ways.len() / n_ranges..(i + 1) * ways.len() / n_ranges)
+        .collect();
+    ranges.into_par_iter().try_for_each(|range| {
+        let mut local = LocalPairs::new(buckets);
+        let mut nodes = Vec::new();
+        for w in range {
+            nodes.clear();
+            nodes.extend(
+                ways[w]
+                    .refs()
+                    .filter_map(|ri| nodes_index[ri as usize].value()),
+            );
+            nodes.sort_unstable();
+            nodes.dedup();
+            for &n in &nodes {
+                local.push(n, w as u64)?;
+            }
         }
-    }
-    Ok(())
+        local.flush()
+    })
 }
 
 /// Visit each distinct (member, relation) pair, relations in index order.
@@ -167,7 +187,7 @@ fn for_each_member(
 /// index range so that concatenating the sorted buckets in order yields every
 /// pair sorted by `(child, parent)`.
 struct PairBuckets {
-    buckets: Vec<PairSink>,
+    buckets: Vec<Mutex<PairSink>>,
     n_children: u64,
 }
 
@@ -178,7 +198,7 @@ impl PairBuckets {
             .div_ceil(TARGET_PAIRS_PER_BUCKET)
             .clamp(1, n_children.max(1));
         let buckets = (0..n_buckets)
-            .map(|_| PairSink::new(dir))
+            .map(|_| PairSink::new(dir).map(Mutex::new))
             .collect::<Result<_, _>>()?;
         Ok(PairBuckets {
             buckets,
@@ -186,12 +206,19 @@ impl PairBuckets {
         })
     }
 
+    /// The bucket holding `child`. Children are spread evenly across buckets
+    /// by index; `u128` keeps `child * n_buckets` from overflowing.
+    fn bucket_of(&self, child: u64) -> usize {
+        (child as u128 * self.buckets.len() as u128 / self.n_children as u128) as usize
+    }
+
+    /// Push one pair from a single-threaded collect pass.
     fn push(&mut self, child: u64, parent: u64) -> Result<(), BuildError> {
-        // Children are spread evenly across buckets by index; `u128` keeps
-        // `child * n_buckets` from overflowing.
-        let bucket =
-            (child as u128 * self.buckets.len() as u128 / self.n_children as u128) as usize;
-        self.buckets[bucket].push(child, parent)
+        let bucket = self.bucket_of(child);
+        self.buckets[bucket]
+            .get_mut()
+            .expect("bucket lock poisoned")
+            .push(child, parent)
     }
 
     /// Stream the map out as a CSR pair: one `Range` per child (plus the
@@ -205,7 +232,10 @@ impl PairBuckets {
         let mut next_child = 0u64;
         let mut written = 0u64;
         let window = rayon::current_num_threads();
-        let mut buckets = self.buckets.into_iter();
+        let mut buckets = self
+            .buckets
+            .into_iter()
+            .map(|b| b.into_inner().expect("bucket lock poisoned"));
         loop {
             // Read back and sort the next window of buckets in parallel, then
             // write them out in bucket order. `par_sort_unstable` also
@@ -243,6 +273,52 @@ impl PairBuckets {
         }
         ranges.close()?;
         posts.close()?;
+        Ok(())
+    }
+}
+
+/// A collect worker's per-bucket buffers over shared [`PairBuckets`]: pairs
+/// are batched locally and appended under a bucket's lock only when its
+/// buffer fills, so workers rarely contend.
+struct LocalPairs<'a> {
+    buckets: &'a PairBuckets,
+    buffers: Vec<Vec<(u64, u64)>>,
+}
+
+impl<'a> LocalPairs<'a> {
+    fn new(buckets: &'a PairBuckets) -> Self {
+        LocalPairs {
+            buckets,
+            buffers: vec![Vec::new(); buckets.buckets.len()],
+        }
+    }
+
+    fn push(&mut self, child: u64, parent: u64) -> Result<(), BuildError> {
+        let bucket = self.buckets.bucket_of(child);
+        let buffer = &mut self.buffers[bucket];
+        buffer.push((child, parent));
+        if buffer.len() >= LOCAL_BUFFER_PAIRS {
+            Self::append(&self.buckets.buckets[bucket], buffer)?;
+        }
+        Ok(())
+    }
+
+    /// Append every buffered pair. Must be called when the worker finishes.
+    fn flush(mut self) -> Result<(), BuildError> {
+        for (bucket, buffer) in self.buckets.buckets.iter().zip(&mut self.buffers) {
+            Self::append(bucket, buffer)?;
+        }
+        Ok(())
+    }
+
+    fn append(bucket: &Mutex<PairSink>, buffer: &mut Vec<(u64, u64)>) -> Result<(), BuildError> {
+        if !buffer.is_empty() {
+            bucket
+                .lock()
+                .expect("bucket lock poisoned")
+                .extend(buffer)?;
+            buffer.clear();
+        }
         Ok(())
     }
 }

@@ -125,6 +125,21 @@ impl PairSink {
         Ok(())
     }
 
+    /// Append a batch of records, in order.
+    pub(crate) fn extend(&mut self, records: &[(u64, u64)]) -> Result<(), BuildError> {
+        match self {
+            PairSink::Ram(v) => v.extend_from_slice(records),
+            PairSink::File { writer, len } => {
+                for &(a, b) in records {
+                    writer.write_all(&a.to_le_bytes())?;
+                    writer.write_all(&b.to_le_bytes())?;
+                }
+                *len += records.len();
+            }
+        }
+        Ok(())
+    }
+
     /// Consume the sink and return all records, in insertion order.
     pub(crate) fn into_records(self) -> Result<Vec<(u64, u64)>, BuildError> {
         match self {
