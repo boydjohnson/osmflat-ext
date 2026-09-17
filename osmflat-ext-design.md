@@ -480,9 +480,21 @@ per key, and `--value-search` runs its own count-then-fill over value strings
 
 ### 6.3 Backrefs build
 
-Two CSR two-pass builds (node→ways from `nodes_index`; X→relations from
-`relation_members`), structurally identical to 6.2 Phases 1–2 but keyed on the
-parent index rather than a tag slot — so no dictionary phase.
+Four reverse maps (node→ways from `nodes_index`; node/way/relation→relations
+from `relation_members`), each built by sorting its `(child, parent)` pairs
+rather than by count-then-fill. One pass over the parents appends each pair to
+one of several buckets covering contiguous child-index ranges (about 16 M
+pairs per bucket; temp files under `--mmap-scratch`, RAM otherwise). The
+buckets are then read back in order, each sorted in RAM, and streamed straight
+into the output `Range`/`Ref` vectors. Sorting by `(child, parent)` keeps each
+child's postings ascending, as in 6.2.
+
+A count-then-fill build needs child-sized offset and cursor arrays per map —
+about 5 GB each for a continent's nodes, even for node→relations where few
+nodes have any — written at scattered positions. On a South America parent
+that meant ~27 GB of mmap scratch on a 16 GB laptop and a build dominated by
+page faults. The bucketed sort only ever holds one bucket in RAM, and all of
+its writes are sequential.
 
 ### 6.4 Memory / scratch budget
 
@@ -500,7 +512,7 @@ Build-time structures, as implemented (`T` = tag references =
 | trigram postings | Σ distinct trigrams per value × 8 B | value search | `Scratch` |
 | tag-pair mentions (`--combinations`) | Σ pairs × 16 B | combinations | sequential bucket files |
 | key-pair counts, per-tag combo lists | see §10 limitation 4 | combinations | RAM |
-| backref postings | ~(`nodes_index` + Σ members) × 8 B | backrefs | `Scratch` |
+| backref `(child, parent)` pairs | ~(`nodes_index` + Σ members) × 16 B | backrefs | sequential bucket files; one bucket in RAM while sorted |
 
 ### 6.5 Measured: United States extract
 

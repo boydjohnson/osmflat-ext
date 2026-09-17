@@ -8,6 +8,8 @@
 //! when the mapping drops, even on a crash.
 
 use crate::BuildError;
+use std::fs::File;
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 
@@ -84,6 +86,73 @@ impl DerefMut for ScratchU64 {
             Backing::Mmap(m) => unsafe {
                 std::slice::from_raw_parts_mut(m.as_mut_ptr() as *mut u64, self.len)
             },
+        }
+    }
+}
+
+/// Append-only sink of `(u64, u64)` records: a growable RAM buffer, or a
+/// sequential-write unnamed temp file in a scratch directory. Writes are
+/// purely append -- no positional seeking -- which is the cheapest I/O pattern
+/// when the records don't fit in RAM.
+pub(crate) enum PairSink {
+    Ram(Vec<(u64, u64)>),
+    File { writer: BufWriter<File>, len: usize },
+}
+
+impl PairSink {
+    pub(crate) fn new(dir: Option<&Path>) -> Result<Self, BuildError> {
+        match dir {
+            Some(dir) => {
+                std::fs::create_dir_all(dir)?;
+                Ok(PairSink::File {
+                    writer: BufWriter::new(tempfile::tempfile_in(dir)?),
+                    len: 0,
+                })
+            }
+            None => Ok(PairSink::Ram(Vec::new())),
+        }
+    }
+
+    pub(crate) fn push(&mut self, a: u64, b: u64) -> Result<(), BuildError> {
+        match self {
+            PairSink::Ram(v) => v.push((a, b)),
+            PairSink::File { writer, len } => {
+                writer.write_all(&a.to_le_bytes())?;
+                writer.write_all(&b.to_le_bytes())?;
+                *len += 1;
+            }
+        }
+        Ok(())
+    }
+
+    /// Consume the sink and return all records, in insertion order.
+    pub(crate) fn into_records(self) -> Result<Vec<(u64, u64)>, BuildError> {
+        match self {
+            PairSink::Ram(v) => Ok(v),
+            PairSink::File { writer, len } => {
+                let mut file = writer.into_inner().map_err(|e| e.into_error())?;
+                file.seek(SeekFrom::Start(0))?;
+                // Decode through a bounded buffer rather than reading the
+                // whole file first, so a bucket never needs twice its size
+                // in RAM.
+                let mut records = Vec::with_capacity(len);
+                let mut buf = vec![0u8; 16 * 64 * 1024];
+                let mut remaining = len;
+                while remaining > 0 {
+                    let n = remaining.min(buf.len() / 16);
+                    let chunk = &mut buf[..n * 16];
+                    file.read_exact(chunk)?;
+                    records.extend(chunk.as_chunks::<16>().0.iter().map(|c| {
+                        let (a, b) = c.split_at(8);
+                        (
+                            u64::from_le_bytes(a.try_into().unwrap()),
+                            u64::from_le_bytes(b.try_into().unwrap()),
+                        )
+                    }));
+                    remaining -= n;
+                }
+                Ok(records)
+            }
         }
     }
 }

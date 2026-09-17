@@ -31,15 +31,13 @@
 //! co-occurrence counts stay in RAM either way, since they're bounded by
 //! distinct key-set signatures, not by near-unique per-entity value tags.
 
-use crate::scratch::{Scratch, ScratchU64};
+use crate::scratch::{PairSink, Scratch, ScratchU64};
 use crate::{BuildError, BuildOptions};
 use osmflat::Osm;
 use osmflat_ext::taginfo::value_trigrams;
 use osmflat_ext::TaginfoBuilder;
 use rustc_hash::FxHashMap;
 use std::collections::HashMap;
-use std::fs::File;
-use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 /// CSR postings for one entity type, slot positions in dictionary order.
@@ -414,63 +412,6 @@ impl Dictionary {
 /// `ulimit -n` is in the hundreds of thousands).
 const N_TAG_BUCKETS: usize = 256;
 
-/// Append-only sink for one radix bucket's `(slot, other_slot)` mentions:
-/// a growable RAM buffer without `--mmap-scratch`, or a sequential-write
-/// temp file with it. Either way, writes are purely append/sequential — no
-/// positional seeking — which is what avoids the thrashing a direct CSR
-/// fill into one huge array causes (see module docs).
-enum BucketSink {
-    Ram(Vec<(u64, u64)>),
-    File(BufWriter<File>),
-}
-
-impl BucketSink {
-    fn new(dir: Option<&Path>) -> Result<Self, BuildError> {
-        match dir {
-            Some(dir) => {
-                std::fs::create_dir_all(dir)?;
-                Ok(BucketSink::File(BufWriter::new(tempfile::tempfile_in(
-                    dir,
-                )?)))
-            }
-            None => Ok(BucketSink::Ram(Vec::new())),
-        }
-    }
-
-    fn push(&mut self, slot: u64, other_slot: u64) -> Result<(), BuildError> {
-        match self {
-            BucketSink::Ram(v) => v.push((slot, other_slot)),
-            BucketSink::File(w) => {
-                w.write_all(&slot.to_le_bytes())?;
-                w.write_all(&other_slot.to_le_bytes())?;
-            }
-        }
-        Ok(())
-    }
-
-    /// Consume the sink and return all `(slot, other_slot)` records.
-    fn into_records(self) -> Result<Vec<(u64, u64)>, BuildError> {
-        match self {
-            BucketSink::Ram(v) => Ok(v),
-            BucketSink::File(w) => {
-                let mut file = w.into_inner().map_err(|e| e.into_error())?;
-                file.seek(SeekFrom::Start(0))?;
-                let mut buf = Vec::new();
-                file.read_to_end(&mut buf)?;
-                Ok(buf
-                    .chunks_exact(16)
-                    .map(|c| {
-                        (
-                            u64::from_le_bytes(c[0..8].try_into().unwrap()),
-                            u64::from_le_bytes(c[8..16].try_into().unwrap()),
-                        )
-                    })
-                    .collect())
-            }
-        }
-    }
-}
-
 #[derive(Default)]
 struct Cooccurrences {
     by_key: HashMap<u64, Vec<Combo>>,
@@ -526,8 +467,8 @@ impl Cooccurrences {
         // repeat (the common case) costs no allocation; only a
         // never-seen-before signature pays for the owned `Vec` key.
         let mut key_set_counts: FxHashMap<Vec<u64>, u64> = FxHashMap::default();
-        let mut buckets: Vec<BucketSink> = (0..N_TAG_BUCKETS)
-            .map(|_| BucketSink::new(mmap_scratch))
+        let mut buckets: Vec<PairSink> = (0..N_TAG_BUCKETS)
+            .map(|_| PairSink::new(mmap_scratch))
             .collect::<Result<_, BuildError>>()?;
         let bucket_of =
             |slot: u64| -> usize { ((slot * N_TAG_BUCKETS as u64) / n_slots as u64) as usize };
